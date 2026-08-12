@@ -114,8 +114,8 @@ public class DefaultQueryExecutor implements QueryExecutor {
 
     private Map<String, String> resourceToHashMap;
     private Map<String, TypeDefinitionRegistry> hashToSchemaMap;
-    private Map<String, GraphQLSchema> hashToExecutableSchemaMap;
-    private final ConcurrentHashMap<String, CompletableFuture<GraphQLSchema>> executableSchemaInFlight =
+    private Map<String, BuiltExecutableSchema> hashToExecutableSchemaMap;
+    private final ConcurrentHashMap<String, CompletableFuture<BuiltExecutableSchema>> executableSchemaInFlight =
             new ConcurrentHashMap<>();
     private final Object executableSchemaCacheLock = new Object();
     private final ReadWriteLock readWriteLock = new ReentrantReadWriteLock();
@@ -512,41 +512,60 @@ public class DefaultQueryExecutor implements QueryExecutor {
 
     /**
      * Returns an executable schema for the given SDL hash. When the executable schema cache is enabled,
-     * concurrent callers for the same hash share a single in-flight build (per-key single-flight).
+     * concurrent callers for the same schema hash <em>and</em> scalar generation share a single in-flight build.
      */
     GraphQLSchema getExecutableSchema(@NotNull String schemaHash, @NotNull TypeDefinitionRegistry typeRegistry) {
+        return getExecutableSchema(schemaHash, typeRegistry, true);
+    }
+
+    private GraphQLSchema getExecutableSchema(
+            @NotNull String schemaHash, @NotNull TypeDefinitionRegistry typeRegistry, boolean allowRetry) {
         if (!executableSchemaCacheEnabled) {
             return buildSchema(typeRegistry).schema;
         }
 
-        GraphQLSchema cached = getCachedExecutableSchema(schemaHash);
+        final long scalarGeneration = scalarsProvider.getScalarGeneration();
+        BuiltExecutableSchema cached = getCachedExecutableSchema(schemaHash, scalarGeneration);
         if (cached != null) {
-            return cached;
+            return cached.schema;
         }
 
-        final CompletableFuture<GraphQLSchema> created = new CompletableFuture<>();
-        final CompletableFuture<GraphQLSchema> existing = executableSchemaInFlight.putIfAbsent(schemaHash, created);
+        final String flightKey = schemaHash + ':' + scalarGeneration;
+        final CompletableFuture<BuiltExecutableSchema> created = new CompletableFuture<>();
+        final CompletableFuture<BuiltExecutableSchema> existing =
+                executableSchemaInFlight.putIfAbsent(flightKey, created);
         if (existing != null) {
-            return awaitExecutableSchema(existing);
+            BuiltExecutableSchema built = awaitExecutableSchema(existing);
+            if (built.scalarGeneration == scalarsProvider.getScalarGeneration()) {
+                return built.schema;
+            }
+            // Joined a build that is stale relative to current converters — rebuild once.
+            if (allowRetry) {
+                return getExecutableSchema(schemaHash, typeRegistry, false);
+            }
+            return built.schema;
         }
 
         // Another builder may have finished between the cache miss and putIfAbsent winning.
-        cached = getCachedExecutableSchema(schemaHash);
+        cached = getCachedExecutableSchema(schemaHash, scalarsProvider.getScalarGeneration());
         if (cached != null) {
             created.complete(cached);
-            executableSchemaInFlight.remove(schemaHash, created);
-            return cached;
+            executableSchemaInFlight.remove(flightKey, created);
+            return cached.schema;
         }
 
         try {
             final BuiltExecutableSchema built = buildSchema(typeRegistry);
+            final long currentGeneration = scalarsProvider.getScalarGeneration();
             synchronized (executableSchemaCacheLock) {
-                // Only cache if scalar converters are unchanged since the snapshot used for wiring.
-                if (built.scalarGeneration == scalarsProvider.getScalarGeneration()) {
-                    hashToExecutableSchemaMap.put(schemaHash, built.schema);
+                if (built.scalarGeneration == currentGeneration) {
+                    hashToExecutableSchemaMap.put(schemaHash, built);
                 }
             }
-            created.complete(built.schema);
+            created.complete(built);
+            if (built.scalarGeneration != currentGeneration && allowRetry) {
+                return getExecutableSchema(schemaHash, typeRegistry, false);
+            }
             return built.schema;
         } catch (Exception e) {
             created.completeExceptionally(e);
@@ -558,17 +577,28 @@ public class DefaultQueryExecutor implements QueryExecutor {
             created.completeExceptionally(e);
             throw e;
         } finally {
-            executableSchemaInFlight.remove(schemaHash, created);
+            executableSchemaInFlight.remove(flightKey, created);
         }
     }
 
-    private GraphQLSchema getCachedExecutableSchema(@NotNull String schemaHash) {
+    /**
+     * Returns a cached schema only when its scalar generation still matches {@code expectedGeneration}.
+     */
+    private BuiltExecutableSchema getCachedExecutableSchema(@NotNull String schemaHash, long expectedGeneration) {
         synchronized (executableSchemaCacheLock) {
-            return hashToExecutableSchemaMap.get(schemaHash);
+            BuiltExecutableSchema entry = hashToExecutableSchemaMap.get(schemaHash);
+            if (entry == null) {
+                return null;
+            }
+            if (entry.scalarGeneration != expectedGeneration) {
+                hashToExecutableSchemaMap.remove(schemaHash, entry);
+                return null;
+            }
+            return entry;
         }
     }
 
-    private static GraphQLSchema awaitExecutableSchema(CompletableFuture<GraphQLSchema> future) {
+    private static BuiltExecutableSchema awaitExecutableSchema(CompletableFuture<BuiltExecutableSchema> future) {
         try {
             return future.get();
         } catch (InterruptedException e) {

@@ -275,15 +275,39 @@ public class DefaultQueryExecutorCacheTest {
     }
 
     @Test
+    public void testExecutableSchemaCache_RejectsStaleCacheEntryOnHit() {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        GraphQLSchema first = executor.getExecutableSchema(hash, registry);
+        assertNotNull(first);
+        assertSame(first, executor.getExecutableSchema(hash, registry));
+
+        // Converter set changed after the entry was cached
+        when(scalarsProvider.getScalarGeneration()).thenReturn(1L);
+        when(scalarsProvider.getCustomScalars(any()))
+                .thenReturn(new SlingScalarsProvider.CustomScalars(1L, Collections.emptyList()));
+
+        GraphQLSchema second = executor.getExecutableSchema(hash, registry);
+        assertNotNull(second);
+        assertNotSame(first, second);
+        assertSame(second, executor.getExecutableSchema(hash, registry));
+    }
+
+    @Test
     public void testExecutableSchemaCache_WaiterSeesRuntimeFailure() throws Exception {
         activate(10, true);
         String sdl = "type Query { hello: String }";
         TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
         String hash = SHA256Hasher.getHash(sdl);
 
-        CompletableFuture<GraphQLSchema> failed = new CompletableFuture<>();
+        CompletableFuture<Object> failed = new CompletableFuture<>();
         failed.completeExceptionally(new IllegalStateException("build failed"));
-        inFlightMap().put(hash, failed);
+        @SuppressWarnings({"rawtypes", "unchecked"})
+        CompletableFuture raw = failed;
+        inFlightMap().put(hash + ":0", raw);
 
         try {
             executor.getExecutableSchema(hash, registry);
@@ -300,9 +324,11 @@ public class DefaultQueryExecutorCacheTest {
         TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
         String hash = SHA256Hasher.getHash(sdl);
 
-        CompletableFuture<GraphQLSchema> failed = new CompletableFuture<>();
+        CompletableFuture<Object> failed = new CompletableFuture<>();
         failed.completeExceptionally(new Exception("checked failure"));
-        inFlightMap().put(hash, failed);
+        @SuppressWarnings({"rawtypes", "unchecked"})
+        CompletableFuture raw = failed;
+        inFlightMap().put(hash + ":0", raw);
 
         try {
             executor.getExecutableSchema(hash, registry);
@@ -321,7 +347,7 @@ public class DefaultQueryExecutorCacheTest {
         String hash = SHA256Hasher.getHash(sdl);
 
         // Never-completing future so the waiter blocks in Future.get()
-        inFlightMap().put(hash, new CompletableFuture<>());
+        inFlightMap().put(hash + ":0", new CompletableFuture<>());
 
         final CountDownLatch entered = new CountDownLatch(1);
         final CountDownLatch done = new CountDownLatch(1);
@@ -356,9 +382,9 @@ public class DefaultQueryExecutorCacheTest {
     }
 
     @SuppressWarnings("unchecked")
-    private ConcurrentHashMap<String, CompletableFuture<GraphQLSchema>> inFlightMap() throws Exception {
+    private ConcurrentHashMap<String, CompletableFuture<?>> inFlightMap() throws Exception {
         Field field = DefaultQueryExecutor.class.getDeclaredField("executableSchemaInFlight");
         field.setAccessible(true);
-        return (ConcurrentHashMap<String, CompletableFuture<GraphQLSchema>>) field.get(executor);
+        return (ConcurrentHashMap<String, CompletableFuture<?>>) field.get(executor);
     }
 }
