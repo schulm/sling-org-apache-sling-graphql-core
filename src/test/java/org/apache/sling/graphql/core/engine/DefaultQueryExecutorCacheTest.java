@@ -32,6 +32,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import graphql.schema.GraphQLSchema;
 import graphql.schema.idl.TypeDefinitionRegistry;
@@ -308,6 +309,68 @@ public class DefaultQueryExecutorCacheTest {
 
         when(scalarsProvider.getScalarGeneration()).thenReturn(1L);
         assertSame(newer, executor.getExecutableSchema(hash, registry));
+    }
+
+    @Test
+    public void testExecutableSchemaCache_ErrorDuringBuildUnblocksWaiters() throws Exception {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        final CountDownLatch buildStarted = new CountDownLatch(1);
+        final CountDownLatch releaseBuild = new CountDownLatch(1);
+        when(scalarsProvider.getCustomScalars(any())).thenAnswer(invocation -> {
+            buildStarted.countDown();
+            if (!releaseBuild.await(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Timed out waiting to release schema build");
+            }
+            throw new AssertionError("simulated builder abort");
+        });
+
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<?> builder = pool.submit(() -> {
+                try {
+                    executor.getExecutableSchema(hash, registry);
+                    fail("Expected AssertionError");
+                } catch (AssertionError expected) {
+                    assertEquals("simulated builder abort", expected.getMessage());
+                }
+            });
+            assertTrue(buildStarted.await(5, TimeUnit.SECONDS));
+
+            final AtomicReference<Thread> waiterThread = new AtomicReference<>();
+            Future<?> waiter = pool.submit(() -> {
+                waiterThread.set(Thread.currentThread());
+                try {
+                    executor.getExecutableSchema(hash, registry);
+                    fail("Expected IllegalStateException from aborted build");
+                } catch (IllegalStateException e) {
+                    assertTrue(e.getMessage().contains("aborted"));
+                }
+            });
+
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (true) {
+                Thread t = waiterThread.get();
+                if (t != null && (t.getState() == Thread.State.WAITING || t.getState() == Thread.State.TIMED_WAITING)) {
+                    break;
+                }
+                if (System.nanoTime() > deadline) {
+                    fail("Waiter thread did not block on in-flight Future.get()");
+                }
+                Thread.yield();
+            }
+
+            releaseBuild.countDown();
+            builder.get(10, TimeUnit.SECONDS);
+            waiter.get(10, TimeUnit.SECONDS);
+            assertTrue(inFlightMap().isEmpty());
+        } finally {
+            releaseBuild.countDown();
+            pool.shutdownNow();
+        }
     }
 
     @Test

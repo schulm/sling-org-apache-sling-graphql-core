@@ -534,51 +534,77 @@ public class DefaultQueryExecutor implements QueryExecutor {
                 return cached.schema;
             }
 
-            final String flightKey = schemaHash + ':' + scalarGeneration;
-            final CompletableFuture<BuiltExecutableSchema> created = new CompletableFuture<>();
-            final CompletableFuture<BuiltExecutableSchema> existing =
-                    executableSchemaInFlight.putIfAbsent(flightKey, created);
-            if (existing != null) {
-                BuiltExecutableSchema built = awaitExecutableSchema(existing);
-                if (built.scalarGeneration == scalarsProvider.getScalarGeneration()) {
-                    return built.schema;
-                }
-                // Joined a stale build — retry with the current generation.
-                continue;
+            GraphQLSchema schema = joinOrBuildExecutableSchema(schemaHash, typeRegistry, scalarGeneration);
+            if (schema != null) {
+                return schema;
             }
-
-            // Another builder may have finished between the cache miss and putIfAbsent winning.
-            cached = getCachedExecutableSchema(schemaHash, scalarsProvider.getScalarGeneration());
-            if (cached != null) {
-                created.complete(cached);
-                executableSchemaInFlight.remove(flightKey, created);
-                return cached.schema;
-            }
-
-            try {
-                final BuiltExecutableSchema built = buildSchema(typeRegistry);
-                publishExecutableSchema(schemaHash, built);
-                created.complete(built);
-                if (built.scalarGeneration == scalarsProvider.getScalarGeneration()) {
-                    return built.schema;
-                }
-                // Converters moved on during the build — retry; never return a known-stale schema.
-            } catch (Exception e) {
-                created.completeExceptionally(e);
-                if (e instanceof RuntimeException) {
-                    throw (RuntimeException) e;
-                }
-                throw new SlingGraphQLException("Executable schema build failed", e);
-            } catch (Error e) {
-                created.completeExceptionally(e);
-                throw e;
-            } finally {
-                executableSchemaInFlight.remove(flightKey, created);
-            }
+            // Result was stale relative to live converters — retry.
         }
 
         throw new SlingGraphQLException("Executable schema build did not stabilize after "
                 + MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS + " attempts (scalar converters changing)");
+    }
+
+    /**
+     * Joins an in-flight build or builds the schema for {@code scalarGeneration}.
+     *
+     * @return the schema when it matches the live scalar generation; {@code null} to signal a retry
+     */
+    private GraphQLSchema joinOrBuildExecutableSchema(
+            @NotNull String schemaHash, @NotNull TypeDefinitionRegistry typeRegistry, long scalarGeneration) {
+        final String flightKey = schemaHash + ':' + scalarGeneration;
+        final CompletableFuture<BuiltExecutableSchema> created = new CompletableFuture<>();
+        final CompletableFuture<BuiltExecutableSchema> existing =
+                executableSchemaInFlight.putIfAbsent(flightKey, created);
+        if (existing != null) {
+            return schemaIfCurrentGeneration(awaitExecutableSchema(existing));
+        }
+
+        // Another builder may have finished between the cache miss and putIfAbsent winning.
+        BuiltExecutableSchema cached = getCachedExecutableSchema(schemaHash, scalarsProvider.getScalarGeneration());
+        if (cached != null) {
+            created.complete(cached);
+            executableSchemaInFlight.remove(flightKey, created);
+            return cached.schema;
+        }
+
+        return buildPublishAndComplete(schemaHash, typeRegistry, flightKey, created);
+    }
+
+    /**
+     * Builds, optionally publishes, and completes {@code created}. Returns the schema when generation is
+     * still current, otherwise {@code null} so the caller can retry. Does not catch {@link Error}; if the
+     * builder aborts with an Error, {@code finally} still completes the future so waiters do not hang.
+     */
+    private GraphQLSchema buildPublishAndComplete(
+            @NotNull String schemaHash,
+            @NotNull TypeDefinitionRegistry typeRegistry,
+            @NotNull String flightKey,
+            @NotNull CompletableFuture<BuiltExecutableSchema> created) {
+        try {
+            final BuiltExecutableSchema built = buildSchema(typeRegistry);
+            publishExecutableSchema(schemaHash, built);
+            created.complete(built);
+            return schemaIfCurrentGeneration(built);
+        } catch (Exception e) {
+            created.completeExceptionally(e);
+            if (e instanceof RuntimeException) {
+                throw (RuntimeException) e;
+            }
+            throw new SlingGraphQLException("Executable schema build failed", e);
+        } finally {
+            if (!created.isDone()) {
+                created.completeExceptionally(new IllegalStateException("Executable schema build aborted"));
+            }
+            executableSchemaInFlight.remove(flightKey, created);
+        }
+    }
+
+    private GraphQLSchema schemaIfCurrentGeneration(@NotNull BuiltExecutableSchema built) {
+        if (built.scalarGeneration == scalarsProvider.getScalarGeneration()) {
+            return built.schema;
+        }
+        return null;
     }
 
     /**
