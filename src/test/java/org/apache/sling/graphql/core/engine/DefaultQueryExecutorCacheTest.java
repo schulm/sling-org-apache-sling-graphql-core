@@ -22,6 +22,7 @@ import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -238,7 +239,7 @@ public class DefaultQueryExecutorCacheTest {
     }
 
     @Test
-    public void testExecutableSchemaCache_SkipsPublishWhenScalarGenerationChanges() {
+    public void testExecutableSchemaCache_FailsWhenScalarGenerationNeverStabilizes() {
         activate(10, true);
         String sdl = "type Query { hello: String }";
         TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
@@ -246,15 +247,67 @@ public class DefaultQueryExecutorCacheTest {
 
         when(scalarsProvider.getCustomScalars(any()))
                 .thenReturn(new SlingScalarsProvider.CustomScalars(1L, Collections.emptyList()));
-        // Generation moved on before publish → must not cache
+        // Live generation always ahead of the snapshot used for wiring → never stable
         when(scalarsProvider.getScalarGeneration()).thenReturn(2L);
 
-        GraphQLSchema first = executor.getExecutableSchema(hash, registry);
-        GraphQLSchema second = executor.getExecutableSchema(hash, registry);
+        try {
+            executor.getExecutableSchema(hash, registry);
+            fail("Expected SlingGraphQLException when generation never stabilizes");
+        } catch (SlingGraphQLException e) {
+            assertTrue(e.getMessage().contains("did not stabilize"));
+        }
+    }
 
-        assertNotNull(first);
-        assertNotNull(second);
-        assertNotSame(first, second);
+    @Test
+    public void testExecutableSchemaCache_RetriesUntilScalarGenerationStabilizes() {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        final AtomicInteger liveGeneration = new AtomicInteger(1);
+        when(scalarsProvider.getScalarGeneration()).thenAnswer(invocation -> (long) liveGeneration.get());
+        when(scalarsProvider.getCustomScalars(any())).thenAnswer(invocation -> {
+            long snapshot = liveGeneration.get();
+            // First build sees generation bump before publish; subsequent builds are stable.
+            if (snapshot == 1) {
+                liveGeneration.set(2);
+            }
+            return new SlingScalarsProvider.CustomScalars(snapshot, Collections.emptyList());
+        });
+
+        GraphQLSchema schema = executor.getExecutableSchema(hash, registry);
+        assertNotNull(schema);
+        assertEquals(2, liveGeneration.get());
+        assertSame(schema, executor.getExecutableSchema(hash, registry));
+    }
+
+    @Test
+    public void testExecutableSchemaCache_OldGenerationCallerDoesNotClobberNewerEntry() throws Exception {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        when(scalarsProvider.getScalarGeneration()).thenReturn(1L);
+        when(scalarsProvider.getCustomScalars(any()))
+                .thenReturn(new SlingScalarsProvider.CustomScalars(1L, Collections.emptyList()));
+        GraphQLSchema newer = executor.getExecutableSchema(hash, registry);
+        assertNotNull(newer);
+        assertEquals(1L, cachedGeneration(hash));
+
+        // Delayed old-generation caller
+        when(scalarsProvider.getScalarGeneration()).thenReturn(0L);
+        when(scalarsProvider.getCustomScalars(any()))
+                .thenReturn(new SlingScalarsProvider.CustomScalars(0L, Collections.emptyList()));
+        GraphQLSchema older = executor.getExecutableSchema(hash, registry);
+        assertNotNull(older);
+        assertNotSame(newer, older);
+        // Newer cache entry must remain
+        assertEquals(1L, cachedGeneration(hash));
+
+        when(scalarsProvider.getScalarGeneration()).thenReturn(1L);
+        assertSame(newer, executor.getExecutableSchema(hash, registry));
     }
 
     @Test
@@ -386,5 +439,17 @@ public class DefaultQueryExecutorCacheTest {
         Field field = DefaultQueryExecutor.class.getDeclaredField("executableSchemaInFlight");
         field.setAccessible(true);
         return (ConcurrentHashMap<String, CompletableFuture<?>>) field.get(executor);
+    }
+
+    private long cachedGeneration(String schemaHash) throws Exception {
+        Field field = DefaultQueryExecutor.class.getDeclaredField("hashToExecutableSchemaMap");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, ?> map = (Map<String, ?>) field.get(executor);
+        Object entry = map.get(schemaHash);
+        assertNotNull(entry);
+        Field genField = entry.getClass().getDeclaredField("scalarGeneration");
+        genField.setAccessible(true);
+        return genField.getLong(entry);
     }
 }

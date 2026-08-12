@@ -511,78 +511,96 @@ public class DefaultQueryExecutor implements QueryExecutor {
     }
 
     /**
+     * Cap retries when scalar converters keep changing mid-build so we never return a known-stale schema
+     * and never spin forever under continuous churn.
+     */
+    private static final int MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS = 8;
+
+    /**
      * Returns an executable schema for the given SDL hash. When the executable schema cache is enabled,
      * concurrent callers for the same schema hash <em>and</em> scalar generation share a single in-flight build.
+     * If converters change during a build or while waiting, the call retries until the result matches the
+     * live generation or {@link #MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS} is exhausted.
      */
     GraphQLSchema getExecutableSchema(@NotNull String schemaHash, @NotNull TypeDefinitionRegistry typeRegistry) {
-        return getExecutableSchema(schemaHash, typeRegistry, true);
-    }
-
-    private GraphQLSchema getExecutableSchema(
-            @NotNull String schemaHash, @NotNull TypeDefinitionRegistry typeRegistry, boolean allowRetry) {
         if (!executableSchemaCacheEnabled) {
             return buildSchema(typeRegistry).schema;
         }
 
-        final long scalarGeneration = scalarsProvider.getScalarGeneration();
-        BuiltExecutableSchema cached = getCachedExecutableSchema(schemaHash, scalarGeneration);
-        if (cached != null) {
-            return cached.schema;
-        }
-
-        final String flightKey = schemaHash + ':' + scalarGeneration;
-        final CompletableFuture<BuiltExecutableSchema> created = new CompletableFuture<>();
-        final CompletableFuture<BuiltExecutableSchema> existing =
-                executableSchemaInFlight.putIfAbsent(flightKey, created);
-        if (existing != null) {
-            BuiltExecutableSchema built = awaitExecutableSchema(existing);
-            if (built.scalarGeneration == scalarsProvider.getScalarGeneration()) {
-                return built.schema;
+        for (int attempt = 0; attempt < MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS; attempt++) {
+            final long scalarGeneration = scalarsProvider.getScalarGeneration();
+            BuiltExecutableSchema cached = getCachedExecutableSchema(schemaHash, scalarGeneration);
+            if (cached != null) {
+                return cached.schema;
             }
-            // Joined a build that is stale relative to current converters — rebuild once.
-            if (allowRetry) {
-                return getExecutableSchema(schemaHash, typeRegistry, false);
-            }
-            return built.schema;
-        }
 
-        // Another builder may have finished between the cache miss and putIfAbsent winning.
-        cached = getCachedExecutableSchema(schemaHash, scalarsProvider.getScalarGeneration());
-        if (cached != null) {
-            created.complete(cached);
-            executableSchemaInFlight.remove(flightKey, created);
-            return cached.schema;
-        }
-
-        try {
-            final BuiltExecutableSchema built = buildSchema(typeRegistry);
-            final long currentGeneration = scalarsProvider.getScalarGeneration();
-            synchronized (executableSchemaCacheLock) {
-                if (built.scalarGeneration == currentGeneration) {
-                    hashToExecutableSchemaMap.put(schemaHash, built);
+            final String flightKey = schemaHash + ':' + scalarGeneration;
+            final CompletableFuture<BuiltExecutableSchema> created = new CompletableFuture<>();
+            final CompletableFuture<BuiltExecutableSchema> existing =
+                    executableSchemaInFlight.putIfAbsent(flightKey, created);
+            if (existing != null) {
+                BuiltExecutableSchema built = awaitExecutableSchema(existing);
+                if (built.scalarGeneration == scalarsProvider.getScalarGeneration()) {
+                    return built.schema;
                 }
+                // Joined a stale build — retry with the current generation.
+                continue;
             }
-            created.complete(built);
-            if (built.scalarGeneration != currentGeneration && allowRetry) {
-                return getExecutableSchema(schemaHash, typeRegistry, false);
+
+            // Another builder may have finished between the cache miss and putIfAbsent winning.
+            cached = getCachedExecutableSchema(schemaHash, scalarsProvider.getScalarGeneration());
+            if (cached != null) {
+                created.complete(cached);
+                executableSchemaInFlight.remove(flightKey, created);
+                return cached.schema;
             }
-            return built.schema;
-        } catch (Exception e) {
-            created.completeExceptionally(e);
-            if (e instanceof RuntimeException) {
-                throw (RuntimeException) e;
+
+            try {
+                final BuiltExecutableSchema built = buildSchema(typeRegistry);
+                publishExecutableSchema(schemaHash, built);
+                created.complete(built);
+                if (built.scalarGeneration == scalarsProvider.getScalarGeneration()) {
+                    return built.schema;
+                }
+                // Converters moved on during the build — retry; never return a known-stale schema.
+            } catch (Exception e) {
+                created.completeExceptionally(e);
+                if (e instanceof RuntimeException) {
+                    throw (RuntimeException) e;
+                }
+                throw new SlingGraphQLException("Executable schema build failed", e);
+            } catch (Error e) {
+                created.completeExceptionally(e);
+                throw e;
+            } finally {
+                executableSchemaInFlight.remove(flightKey, created);
             }
-            throw new SlingGraphQLException("Executable schema build failed", e);
-        } catch (Error e) {
-            created.completeExceptionally(e);
-            throw e;
-        } finally {
-            executableSchemaInFlight.remove(flightKey, created);
+        }
+
+        throw new SlingGraphQLException("Executable schema build did not stabilize after "
+                + MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS + " attempts (scalar converters changing)");
+    }
+
+    /**
+     * Publishes {@code built} only when its generation still matches the live converter generation under
+     * the cache lock, and never replaces a newer cached entry with an older one.
+     */
+    private void publishExecutableSchema(@NotNull String schemaHash, @NotNull BuiltExecutableSchema built) {
+        synchronized (executableSchemaCacheLock) {
+            if (built.scalarGeneration != scalarsProvider.getScalarGeneration()) {
+                return;
+            }
+            BuiltExecutableSchema existing = hashToExecutableSchemaMap.get(schemaHash);
+            if (existing == null || existing.scalarGeneration <= built.scalarGeneration) {
+                hashToExecutableSchemaMap.put(schemaHash, built);
+            }
         }
     }
 
     /**
-     * Returns a cached schema only when its scalar generation still matches {@code expectedGeneration}.
+     * Returns a cached schema only when its scalar generation matches {@code expectedGeneration}.
+     * Stale (older) entries may be evicted; a newer entry is left intact so a delayed old-generation
+     * caller cannot discard a valid fresher schema.
      */
     private BuiltExecutableSchema getCachedExecutableSchema(@NotNull String schemaHash, long expectedGeneration) {
         synchronized (executableSchemaCacheLock) {
@@ -590,11 +608,13 @@ public class DefaultQueryExecutor implements QueryExecutor {
             if (entry == null) {
                 return null;
             }
-            if (entry.scalarGeneration != expectedGeneration) {
-                hashToExecutableSchemaMap.remove(schemaHash, entry);
-                return null;
+            if (entry.scalarGeneration == expectedGeneration) {
+                return entry;
             }
-            return entry;
+            if (entry.scalarGeneration < expectedGeneration) {
+                hashToExecutableSchemaMap.remove(schemaHash, entry);
+            }
+            return null;
         }
     }
 
