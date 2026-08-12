@@ -19,10 +19,12 @@
 package org.apache.sling.graphql.core.scalars;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 import graphql.language.ScalarTypeDefinition;
@@ -53,6 +55,12 @@ public class SlingScalarsProvider {
     private final Map<String, TreeSet<ServiceReferenceObjectTuple<SlingScalarConverter<Object, Object>>>> scalars =
             new HashMap<>();
 
+    /**
+     * Monotonic revision of the converter set. Bumped after every successful bind/unbind map update
+     * so callers can detect whether a schema built from an earlier snapshot is still current.
+     */
+    private final AtomicLong scalarGeneration = new AtomicLong();
+
     @Reference(
             service = SlingScalarConverter.class,
             cardinality = ReferenceCardinality.MULTIPLE,
@@ -66,6 +74,7 @@ public class SlingScalarsProvider {
                 TreeSet<ServiceReferenceObjectTuple<SlingScalarConverter<Object, Object>>> set =
                         scalars.computeIfAbsent(name, key -> new TreeSet<>());
                 set.add(new ServiceReferenceObjectTuple<>(serviceReference, scalarConverter));
+                scalarGeneration.incrementAndGet();
             }
         }
     }
@@ -81,26 +90,47 @@ public class SlingScalarsProvider {
                             set.stream()
                                     .filter(tuple -> serviceReference.equals(tuple.getServiceReference()))
                                     .findFirst();
-                    tupleToRemove.ifPresent(set::remove);
+                    if (tupleToRemove.isPresent()) {
+                        set.remove(tupleToRemove.get());
+                        scalarGeneration.incrementAndGet();
+                    }
                 }
             }
         }
     }
 
-    private GraphQLScalarType getScalar(String name) {
-        // Ignore standard scalars
+    /**
+     * @return current scalar converter generation; safe to sample outside a build and re-check before cache publish
+     */
+    public long getScalarGeneration() {
+        return scalarGeneration.get();
+    }
+
+    /**
+     * Returns custom scalars for the given schema together with the converter generation observed while
+     * reading the map, so the caller can refuse to cache if converters change before publication.
+     */
+    public CustomScalars getCustomScalars(Map<String, ScalarTypeDefinition> schemaScalars) {
+        synchronized (scalars) {
+            long generation = scalarGeneration.get();
+            List<GraphQLScalarType> list = schemaScalars.keySet().stream()
+                    .map(this::getScalarLocked)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList());
+            return new CustomScalars(generation, list);
+        }
+    }
+
+    /** Must be called while holding {@code scalars} lock. */
+    private GraphQLScalarType getScalarLocked(String name) {
         if (ScalarInfo.isGraphqlSpecifiedScalar(name)) {
             return null;
         }
-        final SlingScalarConverter<Object, Object> converter;
-        synchronized (scalars) {
-            TreeSet<ServiceReferenceObjectTuple<SlingScalarConverter<Object, Object>>> set = scalars.get(name);
-            if (set == null || set.isEmpty()) {
-                throw new SlingGraphQLException("SlingScalarConverter with name '" + name + "' not found");
-            }
-            converter = set.last().getServiceObject();
+        TreeSet<ServiceReferenceObjectTuple<SlingScalarConverter<Object, Object>>> set = scalars.get(name);
+        if (set == null || set.isEmpty()) {
+            throw new SlingGraphQLException("SlingScalarConverter with name '" + name + "' not found");
         }
-
+        SlingScalarConverter<Object, Object> converter = set.last().getServiceObject();
         return GraphQLScalarType.newScalar()
                 .name(name)
                 .description(converter.toString())
@@ -108,11 +138,24 @@ public class SlingScalarsProvider {
                 .build();
     }
 
-    public Iterable<GraphQLScalarType> getCustomScalars(Map<String, ScalarTypeDefinition> schemaScalars) {
-        // Using just the names for now, not sure why we'd need the ScalarTypeDefinitions
-        return schemaScalars.keySet().stream()
-                .map(this::getScalar)
-                .filter(Objects::nonNull)
-                .collect(Collectors.toList());
+    /**
+     * Snapshot of custom scalar types plus the provider generation at read time.
+     */
+    public static final class CustomScalars {
+        private final long generation;
+        private final Iterable<GraphQLScalarType> scalars;
+
+        public CustomScalars(long generation, Iterable<GraphQLScalarType> scalars) {
+            this.generation = generation;
+            this.scalars = scalars;
+        }
+
+        public long getGeneration() {
+            return generation;
+        }
+
+        public Iterable<GraphQLScalarType> getScalars() {
+            return scalars;
+        }
     }
 }

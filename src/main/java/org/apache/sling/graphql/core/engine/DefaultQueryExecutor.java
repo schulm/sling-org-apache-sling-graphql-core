@@ -69,7 +69,6 @@ import graphql.schema.idl.TypeRuntimeWiring;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.graphql.api.SchemaProvider;
 import org.apache.sling.graphql.api.SlingGraphQLException;
-import org.apache.sling.graphql.api.SlingScalarConverter;
 import org.apache.sling.graphql.api.engine.QueryExecutor;
 import org.apache.sling.graphql.api.engine.ValidationResult;
 import org.apache.sling.graphql.core.directives.Directives;
@@ -80,12 +79,9 @@ import org.apache.sling.graphql.core.util.LogSanitizer;
 import org.apache.sling.graphql.core.util.SlingGraphQLErrorHelper;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
-import org.osgi.framework.ServiceReference;
 import org.osgi.service.component.annotations.Activate;
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.Reference;
-import org.osgi.service.component.annotations.ReferenceCardinality;
-import org.osgi.service.component.annotations.ReferencePolicy;
 import org.osgi.service.metatype.annotations.AttributeDefinition;
 import org.osgi.service.metatype.annotations.Designate;
 import org.osgi.service.metatype.annotations.ObjectClassDefinition;
@@ -242,36 +238,6 @@ public class DefaultQueryExecutor implements QueryExecutor {
         executableSchemaInFlight.clear();
         ExecutableNormalizedOperationFactory.Options.setDefaultOptions(
                 ExecutableNormalizedOperationFactory.Options.defaultOptions().maxFieldsCount(config.maxFieldCount()));
-    }
-
-    /**
-     * Scalars are baked into cached executable schemas at build time. Clear that cache when converters change
-     * so subsequent requests rebuild with the current converter set.
-     */
-    @Reference(
-            service = SlingScalarConverter.class,
-            cardinality = ReferenceCardinality.MULTIPLE,
-            policy = ReferencePolicy.DYNAMIC)
-    private void bindSlingScalarConverter(
-            @SuppressWarnings("unused") ServiceReference<SlingScalarConverter<Object, Object>> reference,
-            @SuppressWarnings("unused") SlingScalarConverter<Object, Object> converter) {
-        clearExecutableSchemaCache();
-    }
-
-    @SuppressWarnings("unused")
-    private void unbindSlingScalarConverter(
-            ServiceReference<SlingScalarConverter<Object, Object>> reference,
-            SlingScalarConverter<Object, Object> converter) {
-        clearExecutableSchemaCache();
-    }
-
-    private void clearExecutableSchemaCache() {
-        if (hashToExecutableSchemaMap != null) {
-            synchronized (executableSchemaCacheLock) {
-                hashToExecutableSchemaMap.clear();
-            }
-        }
-        executableSchemaInFlight.clear();
     }
 
     @Override
@@ -550,7 +516,7 @@ public class DefaultQueryExecutor implements QueryExecutor {
      */
     GraphQLSchema getExecutableSchema(@NotNull String schemaHash, @NotNull TypeDefinitionRegistry typeRegistry) {
         if (!executableSchemaCacheEnabled) {
-            return buildSchema(typeRegistry);
+            return buildSchema(typeRegistry).schema;
         }
 
         GraphQLSchema cached = getCachedExecutableSchema(schemaHash);
@@ -573,21 +539,24 @@ public class DefaultQueryExecutor implements QueryExecutor {
         }
 
         try {
-            final GraphQLSchema built = buildSchema(typeRegistry);
+            final BuiltExecutableSchema built = buildSchema(typeRegistry);
             synchronized (executableSchemaCacheLock) {
-                hashToExecutableSchemaMap.put(schemaHash, built);
+                // Only cache if scalar converters are unchanged since the snapshot used for wiring.
+                if (built.scalarGeneration == scalarsProvider.getScalarGeneration()) {
+                    hashToExecutableSchemaMap.put(schemaHash, built.schema);
+                }
             }
-            created.complete(built);
-            return built;
-        } catch (Throwable t) {
-            created.completeExceptionally(t);
-            if (t instanceof Error) {
-                throw (Error) t;
+            created.complete(built.schema);
+            return built.schema;
+        } catch (Exception e) {
+            created.completeExceptionally(e);
+            if (e instanceof RuntimeException) {
+                throw (RuntimeException) e;
             }
-            if (t instanceof RuntimeException) {
-                throw (RuntimeException) t;
-            }
-            throw new SlingGraphQLException("Executable schema build failed", t);
+            throw new SlingGraphQLException("Executable schema build failed", e);
+        } catch (Error e) {
+            created.completeExceptionally(e);
+            throw e;
         } finally {
             executableSchemaInFlight.remove(schemaHash, created);
         }
@@ -617,10 +586,21 @@ public class DefaultQueryExecutor implements QueryExecutor {
         }
     }
 
-    private GraphQLSchema buildSchema(@NotNull TypeDefinitionRegistry typeRegistry) {
-        Iterable<GraphQLScalarType> scalars = scalarsProvider.getCustomScalars(typeRegistry.scalars());
-        RuntimeWiring runtimeWiring = buildWiring(typeRegistry, scalars);
-        return schemaGenerator.makeExecutableSchema(typeRegistry, runtimeWiring);
+    private BuiltExecutableSchema buildSchema(@NotNull TypeDefinitionRegistry typeRegistry) {
+        SlingScalarsProvider.CustomScalars customScalars = scalarsProvider.getCustomScalars(typeRegistry.scalars());
+        RuntimeWiring runtimeWiring = buildWiring(typeRegistry, customScalars.getScalars());
+        GraphQLSchema schema = schemaGenerator.makeExecutableSchema(typeRegistry, runtimeWiring);
+        return new BuiltExecutableSchema(schema, customScalars.getGeneration());
+    }
+
+    private static final class BuiltExecutableSchema {
+        private final GraphQLSchema schema;
+        private final long scalarGeneration;
+
+        private BuiltExecutableSchema(GraphQLSchema schema, long scalarGeneration) {
+            this.schema = schema;
+            this.scalarGeneration = scalarGeneration;
+        }
     }
 
     private String getCacheKey(@NotNull Resource resource, @NotNull String[] selectors) {

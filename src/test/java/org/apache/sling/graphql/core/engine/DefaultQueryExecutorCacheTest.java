@@ -83,7 +83,13 @@ public class DefaultQueryExecutorCacheTest {
     public void setUp() {
         activate(10, false);
         when(resource.getPath()).thenReturn("/content/test");
-        when(scalarsProvider.getCustomScalars(any())).thenReturn(Collections.emptyList());
+        stubStableScalars();
+    }
+
+    private void stubStableScalars() {
+        when(scalarsProvider.getCustomScalars(any()))
+                .thenReturn(new SlingScalarsProvider.CustomScalars(0L, Collections.emptyList()));
+        when(scalarsProvider.getScalarGeneration()).thenReturn(0L);
     }
 
     private void activate(int schemaCacheSize, boolean executableSchemaCacheEnabled) {
@@ -190,14 +196,16 @@ public class DefaultQueryExecutorCacheTest {
         final CyclicBarrier barrier = new CyclicBarrier(8, started::countDown);
 
         // Hold the winner in buildSchema until other threads have joined the in-flight Future
-        when(scalarsProvider.getCustomScalars(any())).thenAnswer((Answer<Iterable>) invocation -> {
-            buildCalls.incrementAndGet();
-            buildStarted.countDown();
-            if (!releaseBuild.await(5, TimeUnit.SECONDS)) {
-                throw new IllegalStateException("Timed out waiting to release schema build");
-            }
-            return Collections.emptyList();
-        });
+        when(scalarsProvider.getCustomScalars(any()))
+                .thenAnswer((Answer<SlingScalarsProvider.CustomScalars>) invocation -> {
+                    buildCalls.incrementAndGet();
+                    buildStarted.countDown();
+                    if (!releaseBuild.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Timed out waiting to release schema build");
+                    }
+                    return new SlingScalarsProvider.CustomScalars(0L, Collections.emptyList());
+                });
+        when(scalarsProvider.getScalarGeneration()).thenReturn(0L);
 
         ExecutorService pool = Executors.newFixedThreadPool(8);
         List<Future<GraphQLSchema>> futures = new ArrayList<>();
@@ -227,6 +235,26 @@ public class DefaultQueryExecutorCacheTest {
             releaseBuild.countDown();
             pool.shutdownNow();
         }
+    }
+
+    @Test
+    public void testExecutableSchemaCache_SkipsPublishWhenScalarGenerationChanges() {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        when(scalarsProvider.getCustomScalars(any()))
+                .thenReturn(new SlingScalarsProvider.CustomScalars(1L, Collections.emptyList()));
+        // Generation moved on before publish → must not cache
+        when(scalarsProvider.getScalarGeneration()).thenReturn(2L);
+
+        GraphQLSchema first = executor.getExecutableSchema(hash, registry);
+        GraphQLSchema second = executor.getExecutableSchema(hash, registry);
+
+        assertNotNull(first);
+        assertNotNull(second);
+        assertNotSame(first, second);
     }
 
     @Test

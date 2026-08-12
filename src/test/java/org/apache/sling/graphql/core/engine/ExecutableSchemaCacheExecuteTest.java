@@ -27,13 +27,14 @@ import org.apache.sling.graphql.api.engine.QueryExecutor;
 import org.apache.sling.graphql.core.mocks.EchoDataFetcher;
 import org.apache.sling.graphql.core.mocks.TestUtil;
 import org.junit.Test;
-import org.mockito.Mockito;
 
 import static com.jayway.jsonpath.matchers.JsonPathMatchers.hasJsonPath;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.not;
 import static org.junit.Assert.assertNotNull;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * End-to-end execute() coverage with the executable schema cache enabled,
@@ -79,9 +80,9 @@ public class ExecutableSchemaCacheExecuteTest extends ResourceQueryTestBase {
     }
 
     private static Resource mockResource(String path, String resourceType) {
-        Resource r = Mockito.mock(Resource.class);
-        Mockito.when(r.getPath()).thenReturn(path);
-        Mockito.when(r.getResourceType()).thenReturn(resourceType);
+        Resource r = mock(Resource.class);
+        when(r.getPath()).thenReturn(path);
+        when(r.getResourceType()).thenReturn(resourceType);
         return r;
     }
 }
