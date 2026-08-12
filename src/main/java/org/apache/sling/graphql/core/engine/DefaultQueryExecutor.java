@@ -549,9 +549,6 @@ public class DefaultQueryExecutor implements QueryExecutor {
         } catch (RuntimeException e) {
             created.completeExceptionally(e);
             throw e;
-        } catch (Exception e) {
-            created.completeExceptionally(e);
-            throw new SlingGraphQLException("Executable schema build failed", e);
         } finally {
             executableSchemaInFlight.remove(schemaHash, created);
         }

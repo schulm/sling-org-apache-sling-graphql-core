@@ -18,9 +18,12 @@
  */
 package org.apache.sling.graphql.core.engine;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
@@ -32,6 +35,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import graphql.schema.GraphQLSchema;
 import graphql.schema.idl.TypeDefinitionRegistry;
 import org.apache.sling.api.resource.Resource;
+import org.apache.sling.graphql.api.SlingGraphQLException;
 import org.apache.sling.graphql.core.hash.SHA256Hasher;
 import org.apache.sling.graphql.core.scalars.SlingScalarsProvider;
 import org.apache.sling.graphql.core.schema.RankedSchemaProviders;
@@ -43,10 +47,12 @@ import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
 import org.mockito.stubbing.Answer;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -214,5 +220,104 @@ public class DefaultQueryExecutorCacheTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    @Test
+    public void testExecutableSchemaCache_BuildRuntimeExceptionPropagates() {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        when(scalarsProvider.getCustomScalars(any())).thenThrow(new IllegalStateException("boom"));
+
+        try {
+            executor.getExecutableSchema(hash, registry);
+            fail("Expected IllegalStateException");
+        } catch (IllegalStateException e) {
+            assertEquals("boom", e.getMessage());
+        }
+    }
+
+    @Test
+    public void testExecutableSchemaCache_WaiterSeesRuntimeFailure() throws Exception {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        CompletableFuture<GraphQLSchema> failed = new CompletableFuture<>();
+        failed.completeExceptionally(new IllegalStateException("build failed"));
+        inFlightMap().put(hash, failed);
+
+        try {
+            executor.getExecutableSchema(hash, registry);
+            fail("Expected IllegalStateException");
+        } catch (IllegalStateException e) {
+            assertEquals("build failed", e.getMessage());
+        }
+    }
+
+    @Test
+    public void testExecutableSchemaCache_WaiterSeesNonRuntimeFailure() throws Exception {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        CompletableFuture<GraphQLSchema> failed = new CompletableFuture<>();
+        failed.completeExceptionally(new Exception("checked failure"));
+        inFlightMap().put(hash, failed);
+
+        try {
+            executor.getExecutableSchema(hash, registry);
+            fail("Expected SlingGraphQLException");
+        } catch (SlingGraphQLException e) {
+            assertTrue(e.getMessage().contains("Executable schema build failed"));
+            assertEquals("checked failure", e.getCause().getMessage());
+        }
+    }
+
+    @Test
+    public void testExecutableSchemaCache_WaiterInterrupted() throws Exception {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        // Never-completing future so the waiter blocks in Future.get()
+        inFlightMap().put(hash, new CompletableFuture<>());
+
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch done = new CountDownLatch(1);
+        final AtomicInteger failures = new AtomicInteger();
+        Thread waiter = new Thread(() -> {
+            try {
+                entered.countDown();
+                executor.getExecutableSchema(hash, registry);
+            } catch (SlingGraphQLException e) {
+                if (e.getMessage().contains("Interrupted while waiting")
+                        && Thread.currentThread().isInterrupted()) {
+                    failures.incrementAndGet();
+                }
+            } finally {
+                done.countDown();
+            }
+        });
+        waiter.start();
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        // Allow the thread to block inside Future.get()
+        Thread.sleep(50);
+        waiter.interrupt();
+        assertTrue(done.await(5, TimeUnit.SECONDS));
+        assertEquals(1, failures.get());
+        inFlightMap().clear();
+    }
+
+    @SuppressWarnings("unchecked")
+    private ConcurrentHashMap<String, CompletableFuture<GraphQLSchema>> inFlightMap() throws Exception {
+        Field field = DefaultQueryExecutor.class.getDeclaredField("executableSchemaInFlight");
+        field.setAccessible(true);
+        return (ConcurrentHashMap<String, CompletableFuture<GraphQLSchema>>) field.get(executor);
     }
 }
