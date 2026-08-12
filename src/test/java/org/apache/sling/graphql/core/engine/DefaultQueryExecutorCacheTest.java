@@ -18,8 +18,21 @@
  */
 package org.apache.sling.graphql.core.engine;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import graphql.schema.GraphQLSchema;
 import graphql.schema.idl.TypeDefinitionRegistry;
 import org.apache.sling.api.resource.Resource;
+import org.apache.sling.graphql.core.hash.SHA256Hasher;
 import org.apache.sling.graphql.core.scalars.SlingScalarsProvider;
 import org.apache.sling.graphql.core.schema.RankedSchemaProviders;
 import org.junit.Before;
@@ -28,9 +41,15 @@ import org.junit.runner.RunWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
+import org.mockito.stubbing.Answer;
 
-import static org.junit.Assert.*;
-import static org.mockito.Mockito.*;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @RunWith(MockitoJUnitRunner.class)
 public class DefaultQueryExecutorCacheTest {
@@ -55,16 +74,19 @@ public class DefaultQueryExecutorCacheTest {
 
     @Before
     public void setUp() {
-        // Activate the component with default config
+        activate(10, false);
+        when(resource.getPath()).thenReturn("/content/test");
+        when(scalarsProvider.getCustomScalars(any())).thenReturn(Collections.emptyList());
+    }
+
+    private void activate(int schemaCacheSize, boolean executableSchemaCacheEnabled) {
         DefaultQueryExecutor.Config config = mock(DefaultQueryExecutor.Config.class);
-        when(config.schemaCacheSize()).thenReturn(10);
+        when(config.schemaCacheSize()).thenReturn(schemaCacheSize);
+        when(config.executableSchemaCacheEnabled()).thenReturn(executableSchemaCacheEnabled);
         when(config.maxQueryTokens()).thenReturn(15000);
         when(config.maxWhitespaceTokens()).thenReturn(200000);
         when(config.maxFieldCount()).thenReturn(100000);
-
         executor.activate(config);
-
-        when(resource.getPath()).thenReturn("/content/test");
     }
 
     @Test
@@ -90,9 +112,7 @@ public class DefaultQueryExecutorCacheTest {
 
     @Test
     public void testGetTypeDefinitionRegistry_CacheDisabled() {
-        DefaultQueryExecutor.Config config = mock(DefaultQueryExecutor.Config.class);
-        when(config.schemaCacheSize()).thenReturn(0);
-        executor.activate(config);
+        activate(0, false);
 
         String sdl = "type Query { hello: String }";
         String[] selectors = {"test"};
@@ -107,9 +127,7 @@ public class DefaultQueryExecutorCacheTest {
         Resource resource2 = mock(Resource.class);
         when(resource2.getPath()).thenReturn("/content/test2");
 
-        DefaultQueryExecutor.Config config = mock(DefaultQueryExecutor.Config.class);
-        when(config.schemaCacheSize()).thenReturn(2);
-        executor.activate(config);
+        activate(2, false);
 
         String sdl = "type Query { hello: String }";
         String[] selectors = {"test"};
@@ -119,5 +137,82 @@ public class DefaultQueryExecutorCacheTest {
         executor.getTypeDefinitionRegistry(sdl + "  ", resource, selectors);
         TypeDefinitionRegistry result = executor.getTypeDefinitionRegistry(sdl, resource2, selectors);
         assertNotNull(result);
+    }
+
+    @Test
+    public void testExecutableSchemaCache_ReusesSameInstance() {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        GraphQLSchema first = executor.getExecutableSchema(hash, registry);
+        GraphQLSchema second = executor.getExecutableSchema(hash, registry);
+
+        assertNotNull(first);
+        assertSame(first, second);
+    }
+
+    @Test
+    public void testExecutableSchemaCache_DisabledBuildsIndependently() {
+        activate(10, false);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        GraphQLSchema first = executor.getExecutableSchema(hash, registry);
+        GraphQLSchema second = executor.getExecutableSchema(hash, registry);
+
+        assertNotNull(first);
+        assertNotNull(second);
+        // Without the cache each call creates a new GraphQLSchema instance
+        assertTrue(first != second);
+    }
+
+    @Test
+    public void testExecutableSchemaCache_SingleFlightUnderContention() throws Exception {
+        activate(10, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        final AtomicInteger buildCalls = new AtomicInteger();
+        final CountDownLatch started = new CountDownLatch(1);
+        final CyclicBarrier barrier = new CyclicBarrier(8, started::countDown);
+
+        // Wrap scalars lookup to observe how often buildSchema runs
+        when(scalarsProvider.getCustomScalars(any())).thenAnswer((Answer<Iterable>) invocation -> {
+            buildCalls.incrementAndGet();
+            // Hold the winner briefly so waiters join the in-flight Future
+            Thread.sleep(50);
+            return Collections.emptyList();
+        });
+
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        List<Future<GraphQLSchema>> futures = new ArrayList<>();
+        try {
+            for (int i = 0; i < 8; i++) {
+                futures.add(pool.submit(() -> {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    return executor.getExecutableSchema(hash, registry);
+                }));
+            }
+            assertTrue(started.await(5, TimeUnit.SECONDS));
+
+            GraphQLSchema first = null;
+            for (Future<GraphQLSchema> future : futures) {
+                GraphQLSchema schema = future.get(10, TimeUnit.SECONDS);
+                assertNotNull(schema);
+                if (first == null) {
+                    first = schema;
+                } else {
+                    assertSame(first, schema);
+                }
+            }
+            assertTrue(
+                    "Expected a single schema build under contention, got " + buildCalls.get(), buildCalls.get() == 1);
+        } finally {
+            pool.shutdownNow();
+        }
     }
 }

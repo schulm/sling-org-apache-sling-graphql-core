@@ -26,6 +26,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -64,9 +67,7 @@ import graphql.schema.idl.SchemaParser;
 import graphql.schema.idl.TypeDefinitionRegistry;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.graphql.api.SchemaProvider;
-import org.apache.sling.graphql.api.SlingDataFetcher;
 import org.apache.sling.graphql.api.SlingGraphQLException;
-import org.apache.sling.graphql.api.SlingTypeResolver;
 import org.apache.sling.graphql.api.engine.QueryExecutor;
 import org.apache.sling.graphql.api.engine.ValidationResult;
 import org.apache.sling.graphql.core.directives.Directives;
@@ -112,6 +113,10 @@ public class DefaultQueryExecutor implements QueryExecutor {
 
     private Map<String, String> resourceToHashMap;
     private Map<String, TypeDefinitionRegistry> hashToSchemaMap;
+    private Map<String, GraphQLSchema> hashToExecutableSchemaMap;
+    private final ConcurrentHashMap<String, CompletableFuture<GraphQLSchema>> executableSchemaInFlight =
+            new ConcurrentHashMap<>();
+    private final Object executableSchemaCacheLock = new Object();
     private final ReadWriteLock readWriteLock = new ReentrantReadWriteLock();
     private final Lock readLock = readWriteLock.readLock();
     private final Lock writeLock = readWriteLock.writeLock();
@@ -120,6 +125,8 @@ public class DefaultQueryExecutor implements QueryExecutor {
     private int maxQueryTokens;
 
     private int maxWhitespaceTokens;
+
+    private boolean executableSchemaCacheEnabled;
 
     @Reference
     private RankedSchemaProviders schemaProvider;
@@ -139,8 +146,17 @@ public class DefaultQueryExecutor implements QueryExecutor {
                 name = "Schema Cache Size",
                 description =
                         "The number of compiled GraphQL schemas to cache. Since a schema normally doesn't change often, they can be"
-                                + " cached and reused, rather than parsed by the engine all the time. The cache is a LRU and will store up to this number of schemas.")
+                                + " cached and reused, rather than parsed by the engine all the time. The cache is a LRU and will store up to this number of schemas."
+                                + " Also bounds the optional executable schema cache when that is enabled.")
         int schemaCacheSize() default 128;
+
+        @AttributeDefinition(
+                name = "Enable Executable Schema Cache",
+                description =
+                        "When enabled, caches the executable GraphQLSchema (makeExecutableSchema result) keyed by SDL hash,"
+                                + " with per-key single-flight so concurrent requests for the same schema share one build."
+                                + " Disable to restore the previous behaviour of rebuilding the executable schema on every request.")
+        boolean executableSchemaCacheEnabled() default false;
 
         @AttributeDefinition(
                 name = "Max Query Tokens",
@@ -181,23 +197,25 @@ public class DefaultQueryExecutor implements QueryExecutor {
                         queryResource, Arrays.toString(selectors)));
             }
             LOGGER.debug("Resource {} maps to GQL schema {}", queryResource.getPath(), schemaSdl);
+            final String schemaHash = SHA256Hasher.getHash(schemaSdl);
             final TypeDefinitionRegistry typeDefinitionRegistry =
                     getTypeDefinitionRegistry(schemaSdl, queryResource, selectors);
-            schema = buildSchema(typeDefinitionRegistry, queryResource);
+            schema = getExecutableSchema(schemaHash, typeDefinitionRegistry);
             input = ExecutionInput.newExecutionInput()
                     .query(query)
                     .variables(variables)
-                    .graphQLContext(getGraphQLContextBuilder())
+                    .graphQLContext(getGraphQLContextBuilder(queryResource))
                     .build();
         }
 
-        private Consumer<GraphQLContext.Builder> getGraphQLContextBuilder() {
+        private Consumer<GraphQLContext.Builder> getGraphQLContextBuilder(@NotNull Resource queryResource) {
             final ParserOptions parserOptions = ParserOptions.getDefaultParserOptions()
                     .transform(builder -> builder.maxTokens(maxQueryTokens)
                             .maxWhitespaceTokens(maxWhitespaceTokens)
                             .build());
             return builder -> builder.put(ParserOptions.class, parserOptions)
-                    .put(InputInterceptor.class, LegacyCoercingInputInterceptor.migratesValues());
+                    .put(InputInterceptor.class, LegacyCoercingInputInterceptor.migratesValues())
+                    .put(Resource.class, queryResource);
         }
     }
 
@@ -209,9 +227,12 @@ public class DefaultQueryExecutor implements QueryExecutor {
         }
         maxQueryTokens = config.maxQueryTokens();
         maxWhitespaceTokens = config.maxWhitespaceTokens();
+        executableSchemaCacheEnabled = config.executableSchemaCacheEnabled() && schemaCacheSize > 0;
 
         resourceToHashMap = new LRUCache<>(schemaCacheSize);
         hashToSchemaMap = new LRUCache<>(schemaCacheSize);
+        hashToExecutableSchemaMap = new LRUCache<>(schemaCacheSize);
+        executableSchemaInFlight.clear();
         ExecutableNormalizedOperationFactory.Options.setDefaultOptions(
                 ExecutableNormalizedOperationFactory.Options.defaultOptions().maxFieldsCount(config.maxFieldCount()));
     }
@@ -311,15 +332,14 @@ public class DefaultQueryExecutor implements QueryExecutor {
         }
     }
 
-    private RuntimeWiring buildWiring(
-            TypeDefinitionRegistry typeRegistry, Iterable<GraphQLScalarType> scalars, Resource r) {
+    private RuntimeWiring buildWiring(TypeDefinitionRegistry typeRegistry, Iterable<GraphQLScalarType> scalars) {
         List<ObjectTypeDefinition> types = typeRegistry.getTypes(ObjectTypeDefinition.class);
         RuntimeWiring.Builder builder = RuntimeWiring.newRuntimeWiring();
         for (ObjectTypeDefinition type : types) {
             builder.type(type.getName(), typeWiring -> {
                 for (FieldDefinition field : type.getFieldDefinitions()) {
                     try {
-                        DataFetcher<Object> fetcher = getDataFetcher(field, r);
+                        DataFetcher<Object> fetcher = getDataFetcher(field);
                         if (fetcher != null) {
                             typeWiring.dataFetcher(field.getName(), fetcher);
                         }
@@ -336,19 +356,18 @@ public class DefaultQueryExecutor implements QueryExecutor {
         scalars.forEach(builder::scalar);
         List<UnionTypeDefinition> unionTypes = typeRegistry.getTypes(UnionTypeDefinition.class);
         for (UnionTypeDefinition type : unionTypes) {
-            wireTypeResolver(builder, type, r);
+            wireTypeResolver(builder, type);
         }
         List<InterfaceTypeDefinition> interfaceTypes = typeRegistry.getTypes(InterfaceTypeDefinition.class);
         for (InterfaceTypeDefinition type : interfaceTypes) {
-            wireTypeResolver(builder, type, r);
+            wireTypeResolver(builder, type);
         }
         return builder.build();
     }
 
-    private <T extends TypeDefinition<T>> void wireTypeResolver(
-            RuntimeWiring.Builder builder, TypeDefinition<T> type, Resource r) {
+    private <T extends TypeDefinition<T>> void wireTypeResolver(RuntimeWiring.Builder builder, TypeDefinition<T> type) {
         try {
-            TypeResolver resolver = getTypeResolver(type, r);
+            TypeResolver resolver = getTypeResolver(type);
             if (resolver != null) {
                 builder.type(type.getName(), typeWriting -> typeWriting.typeResolver(resolver));
             }
@@ -384,7 +403,7 @@ public class DefaultQueryExecutor implements QueryExecutor {
                 name, SlingTypeResolverSelector.RESOLVER_NAME_PATTERN));
     }
 
-    private DataFetcher<Object> getDataFetcher(FieldDefinition field, Resource currentResource) {
+    private DataFetcher<Object> getDataFetcher(FieldDefinition field) {
         DataFetcher<Object> result = null;
         final Directive d = field.getDirectives().stream()
                 .filter(i -> FETCHER_DIRECTIVE.equals(i.getName()))
@@ -394,16 +413,15 @@ public class DefaultQueryExecutor implements QueryExecutor {
             final String name = validateFetcherName(getDirectiveArgumentValue(d, FETCHER_NAME));
             final String options = getDirectiveArgumentValue(d, FETCHER_OPTIONS);
             final String source = getDirectiveArgumentValue(d, FETCHER_SOURCE);
-            SlingDataFetcher<Object> f = dataFetcherSelector.getSlingFetcher(name);
-            if (f != null) {
-                result = new SlingDataFetcherWrapper<>(f, currentResource, options, source);
+            // Presence check at wire time; the wrapper resolves the live OSGi service at fetch time.
+            if (dataFetcherSelector.getSlingFetcher(name) != null) {
+                result = new SlingDataFetcherWrapper<>(dataFetcherSelector, name, options, source);
             }
         }
         return result;
     }
 
-    private <T extends TypeDefinition<T>> TypeResolver getTypeResolver(
-            TypeDefinition<T> typeDefinition, Resource currentResource) {
+    private <T extends TypeDefinition<T>> TypeResolver getTypeResolver(TypeDefinition<T> typeDefinition) {
         TypeResolver resolver = null;
         final Directive d = typeDefinition.getDirectives().stream()
                 .filter(i -> RESOLVER_DIRECTIVE.equals(i.getName()))
@@ -413,9 +431,9 @@ public class DefaultQueryExecutor implements QueryExecutor {
             final String name = validateResolverName(getDirectiveArgumentValue(d, RESOLVER_NAME));
             final String options = getDirectiveArgumentValue(d, RESOLVER_OPTIONS);
             final String source = getDirectiveArgumentValue(d, RESOLVER_SOURCE);
-            SlingTypeResolver<Object> r = typeResolverSelector.getSlingTypeResolver(name);
-            if (r != null) {
-                resolver = new SlingTypeResolverWrapper(r, currentResource, options, source);
+            // Presence check at wire time; the wrapper resolves the live OSGi service at resolve time.
+            if (typeResolverSelector.getSlingTypeResolver(name) != null) {
+                resolver = new SlingTypeResolverWrapper(typeResolverSelector, name, options, source);
             }
         }
         return resolver;
@@ -442,11 +460,13 @@ public class DefaultQueryExecutor implements QueryExecutor {
         readLock.lock();
         String newHash = SHA256Hasher.getHash(sdl);
         /*
-        Since the SchemaProviders that generate the SDL can dynamically change, but also since the resource is passed to the RuntimeWiring,
-        there's a two stage cache:
+        Since the SchemaProviders that generate the SDL can dynamically change, there's a two stage cache for parsed schemas:
 
         1. a mapping between the resource, selectors and the SDL's hash
-        2. a mapping between the hash and the compiled GraphQL schema
+        2. a mapping between the hash and the TypeDefinitionRegistry
+
+        The request Resource is no longer baked into RuntimeWiring; it is supplied via GraphQLContext per execution.
+        An optional third cache (hash → GraphQLSchema) is controlled by executableSchemaCacheEnabled.
          */
         String resourceToHashMapKey = getCacheKey(currentResource, selectors);
         String oldHash = resourceToHashMap.get(resourceToHashMapKey);
@@ -486,9 +506,60 @@ public class DefaultQueryExecutor implements QueryExecutor {
         }
     }
 
-    private GraphQLSchema buildSchema(@NotNull TypeDefinitionRegistry typeRegistry, @NotNull Resource currentResource) {
+    /**
+     * Returns an executable schema for the given SDL hash. When the executable schema cache is enabled,
+     * concurrent callers for the same hash share a single in-flight build (per-key single-flight).
+     */
+    GraphQLSchema getExecutableSchema(@NotNull String schemaHash, @NotNull TypeDefinitionRegistry typeRegistry) {
+        if (!executableSchemaCacheEnabled) {
+            return buildSchema(typeRegistry);
+        }
+
+        synchronized (executableSchemaCacheLock) {
+            GraphQLSchema cached = hashToExecutableSchemaMap.get(schemaHash);
+            if (cached != null) {
+                return cached;
+            }
+        }
+
+        final CompletableFuture<GraphQLSchema> created = new CompletableFuture<>();
+        final CompletableFuture<GraphQLSchema> existing = executableSchemaInFlight.putIfAbsent(schemaHash, created);
+        if (existing != null) {
+            try {
+                return existing.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new SlingGraphQLException("Interrupted while waiting for executable schema build", e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                if (cause instanceof RuntimeException) {
+                    throw (RuntimeException) cause;
+                }
+                throw new SlingGraphQLException("Executable schema build failed", cause);
+            }
+        }
+
+        try {
+            final GraphQLSchema built = buildSchema(typeRegistry);
+            synchronized (executableSchemaCacheLock) {
+                hashToExecutableSchemaMap.put(schemaHash, built);
+            }
+            created.complete(built);
+            return built;
+        } catch (RuntimeException e) {
+            created.completeExceptionally(e);
+            throw e;
+        } catch (Exception e) {
+            created.completeExceptionally(e);
+            throw new SlingGraphQLException("Executable schema build failed", e);
+        } finally {
+            executableSchemaInFlight.remove(schemaHash, created);
+        }
+    }
+
+    private GraphQLSchema buildSchema(@NotNull TypeDefinitionRegistry typeRegistry) {
         Iterable<GraphQLScalarType> scalars = scalarsProvider.getCustomScalars(typeRegistry.scalars());
-        RuntimeWiring runtimeWiring = buildWiring(typeRegistry, scalars, currentResource);
+        RuntimeWiring runtimeWiring = buildWiring(typeRegistry, scalars);
         return schemaGenerator.makeExecutableSchema(typeRegistry, runtimeWiring);
     }
 
