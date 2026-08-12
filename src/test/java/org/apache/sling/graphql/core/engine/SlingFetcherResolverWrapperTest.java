@@ -36,7 +36,6 @@ import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -152,7 +151,7 @@ public class SlingFetcherResolverWrapperTest {
                         GraphQLContext.newContext().of(Resource.class, resource).build());
         @SuppressWarnings("unchecked")
         SlingTypeResolver<Object> resolver = mock(SlingTypeResolver.class);
-        when(typeResolverSelector.getSlingTypeResolver(eq("test/resolver"))).thenReturn(resolver);
+        when(typeResolverSelector.getSlingTypeResolver("test/resolver")).thenReturn(resolver);
         when(resolver.getType(any())).thenReturn("not-a-graphql-object-type");
 
         SlingTypeResolverWrapper wrapper =

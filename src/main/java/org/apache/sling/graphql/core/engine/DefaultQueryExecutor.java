@@ -65,6 +65,7 @@ import graphql.schema.idl.RuntimeWiring;
 import graphql.schema.idl.SchemaGenerator;
 import graphql.schema.idl.SchemaParser;
 import graphql.schema.idl.TypeDefinitionRegistry;
+import graphql.schema.idl.TypeRuntimeWiring;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.graphql.api.SchemaProvider;
 import org.apache.sling.graphql.api.SlingGraphQLException;
@@ -337,19 +338,7 @@ public class DefaultQueryExecutor implements QueryExecutor {
         RuntimeWiring.Builder builder = RuntimeWiring.newRuntimeWiring();
         for (ObjectTypeDefinition type : types) {
             builder.type(type.getName(), typeWiring -> {
-                for (FieldDefinition field : type.getFieldDefinitions()) {
-                    try {
-                        DataFetcher<Object> fetcher = getDataFetcher(field);
-                        if (fetcher != null) {
-                            typeWiring.dataFetcher(field.getName(), fetcher);
-                        }
-                    } catch (SlingGraphQLException e) {
-                        throw e;
-                    } catch (Exception e) {
-                        throw new SlingGraphQLException("Exception while building wiring.", e);
-                    }
-                }
-                handleConnectionTypes(type, typeRegistry);
+                wireObjectTypeFields(typeWiring, type, typeRegistry);
                 return typeWiring;
             });
         }
@@ -363,6 +352,23 @@ public class DefaultQueryExecutor implements QueryExecutor {
             wireTypeResolver(builder, type);
         }
         return builder.build();
+    }
+
+    private void wireObjectTypeFields(
+            TypeRuntimeWiring.Builder typeWiring, ObjectTypeDefinition type, TypeDefinitionRegistry typeRegistry) {
+        for (FieldDefinition field : type.getFieldDefinitions()) {
+            try {
+                DataFetcher<Object> fetcher = getDataFetcher(field);
+                if (fetcher != null) {
+                    typeWiring.dataFetcher(field.getName(), fetcher);
+                }
+            } catch (SlingGraphQLException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new SlingGraphQLException("Exception while building wiring.", e);
+            }
+        }
+        handleConnectionTypes(type, typeRegistry);
     }
 
     private <T extends TypeDefinition<T>> void wireTypeResolver(RuntimeWiring.Builder builder, TypeDefinition<T> type) {

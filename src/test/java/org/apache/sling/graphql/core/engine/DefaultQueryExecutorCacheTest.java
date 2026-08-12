@@ -49,6 +49,7 @@ import org.mockito.stubbing.Answer;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -172,7 +173,7 @@ public class DefaultQueryExecutorCacheTest {
         assertNotNull(first);
         assertNotNull(second);
         // Without the cache each call creates a new GraphQLSchema instance
-        assertTrue(first != second);
+        assertNotSame(first, second);
     }
 
     @Test
@@ -184,13 +185,17 @@ public class DefaultQueryExecutorCacheTest {
 
         final AtomicInteger buildCalls = new AtomicInteger();
         final CountDownLatch started = new CountDownLatch(1);
+        final CountDownLatch buildStarted = new CountDownLatch(1);
+        final CountDownLatch releaseBuild = new CountDownLatch(1);
         final CyclicBarrier barrier = new CyclicBarrier(8, started::countDown);
 
-        // Wrap scalars lookup to observe how often buildSchema runs
+        // Hold the winner in buildSchema until other threads have joined the in-flight Future
         when(scalarsProvider.getCustomScalars(any())).thenAnswer((Answer<Iterable>) invocation -> {
             buildCalls.incrementAndGet();
-            // Hold the winner briefly so waiters join the in-flight Future
-            Thread.sleep(50);
+            buildStarted.countDown();
+            if (!releaseBuild.await(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("Timed out waiting to release schema build");
+            }
             return Collections.emptyList();
         });
 
@@ -204,6 +209,8 @@ public class DefaultQueryExecutorCacheTest {
                 }));
             }
             assertTrue(started.await(5, TimeUnit.SECONDS));
+            assertTrue(buildStarted.await(5, TimeUnit.SECONDS));
+            releaseBuild.countDown();
 
             GraphQLSchema first = null;
             for (Future<GraphQLSchema> future : futures) {
@@ -215,9 +222,9 @@ public class DefaultQueryExecutorCacheTest {
                     assertSame(first, schema);
                 }
             }
-            assertTrue(
-                    "Expected a single schema build under contention, got " + buildCalls.get(), buildCalls.get() == 1);
+            assertEquals("Expected a single schema build under contention", 1, buildCalls.get());
         } finally {
+            releaseBuild.countDown();
             pool.shutdownNow();
         }
     }
@@ -306,8 +313,14 @@ public class DefaultQueryExecutorCacheTest {
         });
         waiter.start();
         assertTrue(entered.await(5, TimeUnit.SECONDS));
-        // Allow the thread to block inside Future.get()
-        Thread.sleep(50);
+        // Wait until the thread is blocked inside Future.get()
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (waiter.getState() != Thread.State.WAITING && waiter.getState() != Thread.State.TIMED_WAITING) {
+            if (System.nanoTime() > deadline) {
+                fail("Waiter thread did not block on Future.get()");
+            }
+            Thread.yield();
+        }
         waiter.interrupt();
         assertTrue(done.await(5, TimeUnit.SECONDS));
         assertEquals(1, failures.get());
