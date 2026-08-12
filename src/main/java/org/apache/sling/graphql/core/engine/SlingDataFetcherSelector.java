@@ -72,11 +72,13 @@ public class SlingDataFetcherSelector {
      * Returns a SlingFetcher from the available OSGi services, if there's one registered with the supplied name.
      */
     private SlingDataFetcher<Object> getOsgiServiceFetcher(@NotNull String name) {
-        TreeSet<ServiceReferenceObjectTuple<SlingDataFetcher<Object>>> fetcherSet = dataFetchers.get(name);
-        if (fetcherSet != null && !fetcherSet.isEmpty()) {
-            return fetcherSet.last().getServiceObject();
+        synchronized (dataFetchers) {
+            TreeSet<ServiceReferenceObjectTuple<SlingDataFetcher<Object>>> fetcherSet = dataFetchers.get(name);
+            if (fetcherSet != null && !fetcherSet.isEmpty()) {
+                return fetcherSet.last().getServiceObject();
+            }
+            return null;
         }
-        return null;
     }
 
     private boolean hasValidName(

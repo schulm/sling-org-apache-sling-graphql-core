@@ -69,11 +69,13 @@ public class SlingTypeResolverSelector {
      */
     @Nullable
     public SlingTypeResolver<Object> getSlingTypeResolver(@NotNull String name) {
-        TreeSet<ServiceReferenceObjectTuple<SlingTypeResolver<Object>>> resolvers = typeResolvers.get(name);
-        if (resolvers != null && !resolvers.isEmpty()) {
-            return resolvers.last().getServiceObject();
+        synchronized (typeResolvers) {
+            TreeSet<ServiceReferenceObjectTuple<SlingTypeResolver<Object>>> resolvers = typeResolvers.get(name);
+            if (resolvers != null && !resolvers.isEmpty()) {
+                return resolvers.last().getServiceObject();
+            }
+            return null;
         }
-        return null;
     }
 
     private boolean hasValidName(

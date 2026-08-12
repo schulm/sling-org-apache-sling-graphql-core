@@ -69,6 +69,7 @@ import graphql.schema.idl.TypeRuntimeWiring;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.graphql.api.SchemaProvider;
 import org.apache.sling.graphql.api.SlingGraphQLException;
+import org.apache.sling.graphql.api.SlingScalarConverter;
 import org.apache.sling.graphql.api.engine.QueryExecutor;
 import org.apache.sling.graphql.api.engine.ValidationResult;
 import org.apache.sling.graphql.core.directives.Directives;
@@ -79,9 +80,12 @@ import org.apache.sling.graphql.core.util.LogSanitizer;
 import org.apache.sling.graphql.core.util.SlingGraphQLErrorHelper;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.osgi.framework.ServiceReference;
 import org.osgi.service.component.annotations.Activate;
 import org.osgi.service.component.annotations.Component;
 import org.osgi.service.component.annotations.Reference;
+import org.osgi.service.component.annotations.ReferenceCardinality;
+import org.osgi.service.component.annotations.ReferencePolicy;
 import org.osgi.service.metatype.annotations.AttributeDefinition;
 import org.osgi.service.metatype.annotations.Designate;
 import org.osgi.service.metatype.annotations.ObjectClassDefinition;
@@ -230,12 +234,44 @@ public class DefaultQueryExecutor implements QueryExecutor {
         maxWhitespaceTokens = config.maxWhitespaceTokens();
         executableSchemaCacheEnabled = config.executableSchemaCacheEnabled() && schemaCacheSize > 0;
 
-        resourceToHashMap = new LRUCache<>(schemaCacheSize);
-        hashToSchemaMap = new LRUCache<>(schemaCacheSize);
-        hashToExecutableSchemaMap = new LRUCache<>(schemaCacheSize);
+        // Insertion-order for maps accessed under the shared RW lock (get mutates access-order maps).
+        resourceToHashMap = new BoundedCache<>(schemaCacheSize, false);
+        hashToSchemaMap = new BoundedCache<>(schemaCacheSize, false);
+        // True LRU for the executable schema map (all access is under executableSchemaCacheLock).
+        hashToExecutableSchemaMap = new BoundedCache<>(schemaCacheSize, true);
         executableSchemaInFlight.clear();
         ExecutableNormalizedOperationFactory.Options.setDefaultOptions(
                 ExecutableNormalizedOperationFactory.Options.defaultOptions().maxFieldsCount(config.maxFieldCount()));
+    }
+
+    /**
+     * Scalars are baked into cached executable schemas at build time. Clear that cache when converters change
+     * so subsequent requests rebuild with the current converter set.
+     */
+    @Reference(
+            service = SlingScalarConverter.class,
+            cardinality = ReferenceCardinality.MULTIPLE,
+            policy = ReferencePolicy.DYNAMIC)
+    private void bindSlingScalarConverter(
+            @SuppressWarnings("unused") ServiceReference<SlingScalarConverter<Object, Object>> reference,
+            @SuppressWarnings("unused") SlingScalarConverter<Object, Object> converter) {
+        clearExecutableSchemaCache();
+    }
+
+    @SuppressWarnings("unused")
+    private void unbindSlingScalarConverter(
+            ServiceReference<SlingScalarConverter<Object, Object>> reference,
+            SlingScalarConverter<Object, Object> converter) {
+        clearExecutableSchemaCache();
+    }
+
+    private void clearExecutableSchemaCache() {
+        if (hashToExecutableSchemaMap != null) {
+            synchronized (executableSchemaCacheLock) {
+                hashToExecutableSchemaMap.clear();
+            }
+        }
+        executableSchemaInFlight.clear();
     }
 
     @Override
@@ -419,10 +455,8 @@ public class DefaultQueryExecutor implements QueryExecutor {
             final String name = validateFetcherName(getDirectiveArgumentValue(d, FETCHER_NAME));
             final String options = getDirectiveArgumentValue(d, FETCHER_OPTIONS);
             final String source = getDirectiveArgumentValue(d, FETCHER_SOURCE);
-            // Presence check at wire time; the wrapper resolves the live OSGi service at fetch time.
-            if (dataFetcherSelector.getSlingFetcher(name) != null) {
-                result = new SlingDataFetcherWrapper<>(dataFetcherSelector, name, options, source);
-            }
+            // Always wire a wrapper so later OSGi registrations are visible to cached schemas.
+            result = new SlingDataFetcherWrapper<>(dataFetcherSelector, name, options, source);
         }
         return result;
     }
@@ -437,10 +471,8 @@ public class DefaultQueryExecutor implements QueryExecutor {
             final String name = validateResolverName(getDirectiveArgumentValue(d, RESOLVER_NAME));
             final String options = getDirectiveArgumentValue(d, RESOLVER_OPTIONS);
             final String source = getDirectiveArgumentValue(d, RESOLVER_SOURCE);
-            // Presence check at wire time; the wrapper resolves the live OSGi service at resolve time.
-            if (typeResolverSelector.getSlingTypeResolver(name) != null) {
-                resolver = new SlingTypeResolverWrapper(typeResolverSelector, name, options, source);
-            }
+            // Always wire a wrapper so later OSGi registrations are visible to cached schemas.
+            resolver = new SlingTypeResolverWrapper(typeResolverSelector, name, options, source);
         }
         return resolver;
     }
@@ -521,28 +553,23 @@ public class DefaultQueryExecutor implements QueryExecutor {
             return buildSchema(typeRegistry);
         }
 
-        synchronized (executableSchemaCacheLock) {
-            GraphQLSchema cached = hashToExecutableSchemaMap.get(schemaHash);
-            if (cached != null) {
-                return cached;
-            }
+        GraphQLSchema cached = getCachedExecutableSchema(schemaHash);
+        if (cached != null) {
+            return cached;
         }
 
         final CompletableFuture<GraphQLSchema> created = new CompletableFuture<>();
         final CompletableFuture<GraphQLSchema> existing = executableSchemaInFlight.putIfAbsent(schemaHash, created);
         if (existing != null) {
-            try {
-                return existing.get();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new SlingGraphQLException("Interrupted while waiting for executable schema build", e);
-            } catch (ExecutionException e) {
-                Throwable cause = e.getCause() != null ? e.getCause() : e;
-                if (cause instanceof RuntimeException) {
-                    throw (RuntimeException) cause;
-                }
-                throw new SlingGraphQLException("Executable schema build failed", cause);
-            }
+            return awaitExecutableSchema(existing);
+        }
+
+        // Another builder may have finished between the cache miss and putIfAbsent winning.
+        cached = getCachedExecutableSchema(schemaHash);
+        if (cached != null) {
+            created.complete(cached);
+            executableSchemaInFlight.remove(schemaHash, created);
+            return cached;
         }
 
         try {
@@ -552,11 +579,41 @@ public class DefaultQueryExecutor implements QueryExecutor {
             }
             created.complete(built);
             return built;
-        } catch (RuntimeException e) {
-            created.completeExceptionally(e);
-            throw e;
+        } catch (Throwable t) {
+            created.completeExceptionally(t);
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            if (t instanceof RuntimeException) {
+                throw (RuntimeException) t;
+            }
+            throw new SlingGraphQLException("Executable schema build failed", t);
         } finally {
             executableSchemaInFlight.remove(schemaHash, created);
+        }
+    }
+
+    private GraphQLSchema getCachedExecutableSchema(@NotNull String schemaHash) {
+        synchronized (executableSchemaCacheLock) {
+            return hashToExecutableSchemaMap.get(schemaHash);
+        }
+    }
+
+    private static GraphQLSchema awaitExecutableSchema(CompletableFuture<GraphQLSchema> future) {
+        try {
+            return future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SlingGraphQLException("Interrupted while waiting for executable schema build", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            if (cause instanceof Error) {
+                throw (Error) cause;
+            }
+            if (cause instanceof RuntimeException) {
+                throw (RuntimeException) cause;
+            }
+            throw new SlingGraphQLException("Executable schema build failed", cause);
         }
     }
 
@@ -616,11 +673,16 @@ public class DefaultQueryExecutor implements QueryExecutor {
         }
     }
 
-    private static class LRUCache<T> extends LinkedHashMap<String, T> {
+    /**
+     * Bounded {@link LinkedHashMap}. When {@code accessOrder} is true this is a true LRU (safe only if all
+     * access is externally synchronized). When false, eviction is insertion-order / FIFO.
+     */
+    private static class BoundedCache<T> extends LinkedHashMap<String, T> {
 
         private final int capacity;
 
-        public LRUCache(int capacity) {
+        public BoundedCache(int capacity, boolean accessOrder) {
+            super(16, 0.75f, accessOrder);
             this.capacity = capacity;
         }
 
@@ -639,8 +701,8 @@ public class DefaultQueryExecutor implements QueryExecutor {
             if (o == this) {
                 return true;
             }
-            if (o instanceof LRUCache) {
-                LRUCache<T> other = (LRUCache<T>) o;
+            if (o instanceof BoundedCache) {
+                BoundedCache<T> other = (BoundedCache<T>) o;
                 return super.equals(o) && capacity == other.capacity;
             }
             return false;

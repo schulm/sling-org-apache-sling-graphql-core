@@ -92,11 +92,14 @@ public class SlingScalarsProvider {
         if (ScalarInfo.isGraphqlSpecifiedScalar(name)) {
             return null;
         }
-        TreeSet<ServiceReferenceObjectTuple<SlingScalarConverter<Object, Object>>> set = scalars.get(name);
-        if (set == null || set.isEmpty()) {
-            throw new SlingGraphQLException("SlingScalarConverter with name '" + name + "' not found");
+        final SlingScalarConverter<Object, Object> converter;
+        synchronized (scalars) {
+            TreeSet<ServiceReferenceObjectTuple<SlingScalarConverter<Object, Object>>> set = scalars.get(name);
+            if (set == null || set.isEmpty()) {
+                throw new SlingGraphQLException("SlingScalarConverter with name '" + name + "' not found");
+            }
+            converter = set.last().getServiceObject();
         }
-        SlingScalarConverter<Object, Object> converter = set.last().getServiceObject();
 
         return GraphQLScalarType.newScalar()
                 .name(name)
