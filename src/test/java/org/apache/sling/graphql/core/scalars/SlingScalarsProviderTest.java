@@ -93,12 +93,14 @@ public class SlingScalarsProviderTest {
         long generationBefore = provider.getScalarGeneration();
         reg.unregister();
         assertTrue(provider.getScalarGeneration() > generationBefore);
+        Map<String, ScalarTypeDefinition> missing = schemaScalars("URL");
         try {
-            provider.getCustomScalars(schemaScalars("URL"));
-            fail("Expected missing converter after unbind");
+            provider.getCustomScalars(missing);
         } catch (SlingGraphQLException e) {
             assertTrue(e.getMessage().contains("not found"));
+            return;
         }
+        fail("Expected missing converter after unbind");
     }
 
     @Test

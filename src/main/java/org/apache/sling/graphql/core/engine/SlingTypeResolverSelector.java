@@ -23,6 +23,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
 import org.apache.commons.lang3.StringUtils;
@@ -53,7 +54,8 @@ public class SlingTypeResolverSelector {
             new HashMap<>();
 
     /** Highest-ranked live service per name. Rebuilt on bind/unbind; read without a lock. */
-    private volatile Map<String, SlingTypeResolver<Object>> lookupSnapshot = Collections.emptyMap();
+    private final AtomicReference<Map<String, SlingTypeResolver<Object>>> lookupSnapshot =
+            new AtomicReference<>(Collections.emptyMap());
 
     /**
      * Resolvers which have a name starting with this prefix must be
@@ -73,7 +75,7 @@ public class SlingTypeResolverSelector {
      */
     @Nullable
     public SlingTypeResolver<Object> getSlingTypeResolver(@NotNull String name) {
-        return lookupSnapshot.get(name);
+        return lookupSnapshot.get().get(name);
     }
 
     /**
@@ -88,7 +90,7 @@ public class SlingTypeResolverSelector {
                 next.put(entry.getKey(), set.last().getServiceObject());
             }
         }
-        lookupSnapshot = Collections.unmodifiableMap(next);
+        lookupSnapshot.set(Collections.unmodifiableMap(next));
     }
 
     private boolean hasValidName(
