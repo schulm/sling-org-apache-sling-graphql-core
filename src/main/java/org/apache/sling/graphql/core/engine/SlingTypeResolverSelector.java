@@ -18,6 +18,7 @@
  */
 package org.apache.sling.graphql.core.engine;
 
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -51,6 +52,9 @@ public class SlingTypeResolverSelector {
     private final Map<String, TreeSet<ServiceReferenceObjectTuple<SlingTypeResolver<Object>>>> typeResolvers =
             new HashMap<>();
 
+    /** Highest-ranked live service per name. Rebuilt on bind/unbind; read without a lock. */
+    private volatile Map<String, SlingTypeResolver<Object>> lookupSnapshot = Collections.emptyMap();
+
     /**
      * Resolvers which have a name starting with this prefix must be
      * under the {#link RESERVED_PACKAGE_PREFIX} package.
@@ -69,13 +73,22 @@ public class SlingTypeResolverSelector {
      */
     @Nullable
     public SlingTypeResolver<Object> getSlingTypeResolver(@NotNull String name) {
-        synchronized (typeResolvers) {
-            TreeSet<ServiceReferenceObjectTuple<SlingTypeResolver<Object>>> resolvers = typeResolvers.get(name);
-            if (resolvers != null && !resolvers.isEmpty()) {
-                return resolvers.last().getServiceObject();
+        return lookupSnapshot.get(name);
+    }
+
+    /**
+     * Rebuilds the lock-free lookup map. Caller must hold {@code typeResolvers}.
+     */
+    private void rebuildLookupSnapshot() {
+        Map<String, SlingTypeResolver<Object>> next = new HashMap<>();
+        for (Map.Entry<String, TreeSet<ServiceReferenceObjectTuple<SlingTypeResolver<Object>>>> entry :
+                typeResolvers.entrySet()) {
+            TreeSet<ServiceReferenceObjectTuple<SlingTypeResolver<Object>>> set = entry.getValue();
+            if (set != null && !set.isEmpty()) {
+                next.put(entry.getKey(), set.last().getServiceObject());
             }
-            return null;
         }
+        lookupSnapshot = Collections.unmodifiableMap(next);
     }
 
     private boolean hasValidName(
@@ -131,6 +144,7 @@ public class SlingTypeResolverSelector {
                 TreeSet<ServiceReferenceObjectTuple<SlingTypeResolver<Object>>> resolvers =
                         typeResolvers.computeIfAbsent(name, key -> new TreeSet<>());
                 resolvers.add(new ServiceReferenceObjectTuple<>(reference, slingTypeResolver));
+                rebuildLookupSnapshot();
             }
         }
     }
@@ -145,7 +159,10 @@ public class SlingTypeResolverSelector {
                     Optional<ServiceReferenceObjectTuple<SlingTypeResolver<Object>>> tupleToRemove = resolvers.stream()
                             .filter(tuple -> reference.equals(tuple.getServiceReference()))
                             .findFirst();
-                    tupleToRemove.ifPresent(resolvers::remove);
+                    if (tupleToRemove.isPresent()) {
+                        resolvers.remove(tupleToRemove.get());
+                        rebuildLookupSnapshot();
+                    }
                 }
             }
         }

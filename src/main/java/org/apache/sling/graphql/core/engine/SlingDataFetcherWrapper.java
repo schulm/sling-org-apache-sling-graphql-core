@@ -20,6 +20,7 @@ package org.apache.sling.graphql.core.engine;
 
 import graphql.schema.DataFetcher;
 import graphql.schema.DataFetchingEnvironment;
+import graphql.schema.PropertyDataFetcher;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.graphql.api.SlingDataFetcher;
 import org.apache.sling.graphql.api.SlingGraphQLException;
@@ -51,7 +52,9 @@ class SlingDataFetcherWrapper<T> implements DataFetcher<T> {
         }
         final SlingDataFetcher<T> fetcher = (SlingDataFetcher<T>) selector.getSlingFetcher(name);
         if (fetcher == null) {
-            return null;
+            // Same as graphql-java when no DataFetcher is wired: read a matching source property.
+            return (T) PropertyDataFetcher.fetching(environment.getField().getName())
+                    .get(environment);
         }
         return fetcher.get(new DataFetchingEnvironmentWrapper(environment, currentResource, options, source));
     }

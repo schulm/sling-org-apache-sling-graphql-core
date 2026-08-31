@@ -18,19 +18,26 @@
  */
 package org.apache.sling.graphql.core.engine;
 
+import java.util.HashMap;
+import java.util.Map;
+
 import graphql.GraphQLContext;
 import graphql.TypeResolutionEnvironment;
+import graphql.language.Field;
 import graphql.schema.DataFetchingEnvironment;
 import graphql.schema.GraphQLObjectType;
+import graphql.schema.GraphQLSchema;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.graphql.api.SlingDataFetcher;
 import org.apache.sling.graphql.api.SlingGraphQLException;
 import org.apache.sling.graphql.api.SlingTypeResolver;
+import org.apache.sling.graphql.core.mocks.HumanDTO;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnitRunner;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -68,16 +75,44 @@ public class SlingFetcherResolverWrapperTest {
     }
 
     @Test
-    public void dataFetcher_missingServiceReturnsNull() throws Exception {
+    public void dataFetcher_missingServiceFallsBackToProperty() throws Exception {
         DataFetchingEnvironment env = mock(DataFetchingEnvironment.class);
         when(env.getGraphQlContext())
                 .thenReturn(
                         GraphQLContext.newContext().of(Resource.class, resource).build());
         when(dataFetcherSelector.getSlingFetcher("test/fetcher")).thenReturn(null);
+        Map<String, Object> source = new HashMap<>();
+        source.put("path", "/content/from-property");
+        when(env.getSource()).thenReturn(source);
+        when(env.getField()).thenReturn(Field.newField("path").build());
 
         SlingDataFetcherWrapper<Object> wrapper =
                 new SlingDataFetcherWrapper<>(dataFetcherSelector, "test/fetcher", "opts", "src");
-        assertNull(wrapper.get(env));
+        assertEquals("/content/from-property", wrapper.get(env));
+    }
+
+    @Test
+    public void dataFetcher_sameWrapperSeesLaterRegistration() throws Exception {
+        DataFetchingEnvironment env = mock(DataFetchingEnvironment.class);
+        when(env.getGraphQlContext())
+                .thenReturn(
+                        GraphQLContext.newContext().of(Resource.class, resource).build());
+        Map<String, Object> source = new HashMap<>();
+        source.put("path", "/content/from-property");
+        when(env.getSource()).thenReturn(source);
+        when(env.getField()).thenReturn(Field.newField("path").build());
+        @SuppressWarnings("unchecked")
+        SlingDataFetcher<Object> fetcher = mock(SlingDataFetcher.class);
+        when(fetcher.get(any())).thenReturn("from-osgi");
+        when(dataFetcherSelector.getSlingFetcher("test/fetcher"))
+                .thenReturn(null)
+                .thenReturn(fetcher);
+
+        SlingDataFetcherWrapper<Object> wrapper =
+                new SlingDataFetcherWrapper<>(dataFetcherSelector, "test/fetcher", "opts", "src");
+        assertEquals("/content/from-property", wrapper.get(env));
+        assertSame("from-osgi", wrapper.get(env));
+        verify(fetcher).get(any());
     }
 
     @Test
@@ -123,6 +158,46 @@ public class SlingFetcherResolverWrapperTest {
         SlingTypeResolverWrapper wrapper =
                 new SlingTypeResolverWrapper(typeResolverSelector, "test/resolver", "opts", "src");
         assertNull(wrapper.getType(env));
+    }
+
+    @Test
+    public void typeResolver_missingServiceFallsBackToClassSimpleName() {
+        TypeResolutionEnvironment env = mock(TypeResolutionEnvironment.class);
+        when(env.getGraphQLContext())
+                .thenReturn(
+                        GraphQLContext.newContext().of(Resource.class, resource).build());
+        when(typeResolverSelector.getSlingTypeResolver("test/resolver")).thenReturn(null);
+        HumanDTO human = new HumanDTO("1", "Luke", "Tatooine");
+        GraphQLSchema schema = mock(GraphQLSchema.class);
+        GraphQLObjectType objectType = mock(GraphQLObjectType.class);
+        when(env.getObject()).thenReturn(human);
+        when(env.getSchema()).thenReturn(schema);
+        when(schema.getObjectType("HumanDTO")).thenReturn(objectType);
+
+        SlingTypeResolverWrapper wrapper =
+                new SlingTypeResolverWrapper(typeResolverSelector, "test/resolver", "opts", "src");
+        assertSame(objectType, wrapper.getType(env));
+    }
+
+    @Test
+    public void typeResolver_sameWrapperSeesLaterRegistration() {
+        TypeResolutionEnvironment env = mock(TypeResolutionEnvironment.class);
+        when(env.getGraphQLContext())
+                .thenReturn(
+                        GraphQLContext.newContext().of(Resource.class, resource).build());
+        @SuppressWarnings("unchecked")
+        SlingTypeResolver<Object> resolver = mock(SlingTypeResolver.class);
+        GraphQLObjectType objectType = mock(GraphQLObjectType.class);
+        when(resolver.getType(any())).thenReturn(objectType);
+        when(typeResolverSelector.getSlingTypeResolver("test/resolver"))
+                .thenReturn(null)
+                .thenReturn(resolver);
+
+        SlingTypeResolverWrapper wrapper =
+                new SlingTypeResolverWrapper(typeResolverSelector, "test/resolver", "opts", "src");
+        assertNull(wrapper.getType(env));
+        assertSame(objectType, wrapper.getType(env));
+        verify(resolver).getType(any());
     }
 
     @Test

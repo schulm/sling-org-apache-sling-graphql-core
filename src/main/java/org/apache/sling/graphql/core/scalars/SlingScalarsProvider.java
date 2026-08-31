@@ -18,14 +18,13 @@
  */
 package org.apache.sling.graphql.core.scalars;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors;
 
 import graphql.language.ScalarTypeDefinition;
 import graphql.schema.GraphQLScalarType;
@@ -109,33 +108,45 @@ public class SlingScalarsProvider {
     /**
      * Returns custom scalars for the given schema together with the converter generation observed while
      * reading the map, so the caller can refuse to cache if converters change before publication.
+     * Converter toString() and coercing-wrapper construction run outside the
+     * {@code scalars} monitor so a slow converter cannot stall OSGi bind/unbind.
      */
     public CustomScalars getCustomScalars(Map<String, ScalarTypeDefinition> schemaScalars) {
+        long generation;
+        List<NamedConverter> snapshot;
         synchronized (scalars) {
-            long generation = scalarGeneration.get();
-            List<GraphQLScalarType> list = schemaScalars.keySet().stream()
-                    .map(this::getScalarLocked)
-                    .filter(Objects::nonNull)
-                    .collect(Collectors.toList());
-            return new CustomScalars(generation, list);
+            generation = scalarGeneration.get();
+            snapshot = new ArrayList<>();
+            for (String name : schemaScalars.keySet()) {
+                if (ScalarInfo.isGraphqlSpecifiedScalar(name)) {
+                    continue;
+                }
+                TreeSet<ServiceReferenceObjectTuple<SlingScalarConverter<Object, Object>>> set = scalars.get(name);
+                if (set == null || set.isEmpty()) {
+                    throw new SlingGraphQLException("SlingScalarConverter with name '" + name + "' not found");
+                }
+                snapshot.add(new NamedConverter(name, set.last().getServiceObject()));
+            }
         }
+        List<GraphQLScalarType> list = new ArrayList<>(snapshot.size());
+        for (NamedConverter named : snapshot) {
+            list.add(GraphQLScalarType.newScalar()
+                    .name(named.name)
+                    .description(named.converter.toString())
+                    .coercing(new SlingCoercingWrapper(named.converter))
+                    .build());
+        }
+        return new CustomScalars(generation, list);
     }
 
-    /** Must be called while holding {@code scalars} lock. */
-    private GraphQLScalarType getScalarLocked(String name) {
-        if (ScalarInfo.isGraphqlSpecifiedScalar(name)) {
-            return null;
+    private static final class NamedConverter {
+        private final String name;
+        private final SlingScalarConverter<Object, Object> converter;
+
+        private NamedConverter(String name, SlingScalarConverter<Object, Object> converter) {
+            this.name = name;
+            this.converter = converter;
         }
-        TreeSet<ServiceReferenceObjectTuple<SlingScalarConverter<Object, Object>>> set = scalars.get(name);
-        if (set == null || set.isEmpty()) {
-            throw new SlingGraphQLException("SlingScalarConverter with name '" + name + "' not found");
-        }
-        SlingScalarConverter<Object, Object> converter = set.last().getServiceObject();
-        return GraphQLScalarType.newScalar()
-                .name(name)
-                .description(converter.toString())
-                .coercing(new SlingCoercingWrapper(converter))
-                .build();
     }
 
     /**

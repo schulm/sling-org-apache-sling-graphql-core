@@ -21,6 +21,7 @@ package org.apache.sling.graphql.core.engine;
 import javax.script.ScriptException;
 
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -127,7 +128,10 @@ public class DefaultQueryExecutor implements QueryExecutor {
 
     private int maxWhitespaceTokens;
 
-    private boolean executableSchemaCacheEnabled;
+    private volatile boolean executableSchemaCacheEnabled;
+
+    /** Last scalar generation for which stale executable-schema entries were purged. */
+    private volatile long lastPurgedScalarGeneration;
 
     @Reference
     private RankedSchemaProviders schemaProvider;
@@ -146,10 +150,19 @@ public class DefaultQueryExecutor implements QueryExecutor {
         @AttributeDefinition(
                 name = "Schema Cache Size",
                 description =
-                        "The number of compiled GraphQL schemas to cache. Since a schema normally doesn't change often, they can be"
-                                + " cached and reused, rather than parsed by the engine all the time. The cache is a LRU and will store up to this number of schemas."
-                                + " Also bounds the optional executable schema cache when that is enabled.")
+                        "The number of compiled GraphQL TypeDefinitionRegistry instances to cache. Since a schema normally doesn't"
+                                + " change often, they can be cached and reused, rather than parsed by the engine all the time. Eviction is"
+                                + " insertion-order (FIFO). Set to 0 to disable this cache.")
         int schemaCacheSize() default 128;
+
+        @AttributeDefinition(
+                name = "Executable Schema Cache Size",
+                description =
+                        "The number of fully built GraphQLSchema instances to cache when the executable schema cache is enabled."
+                                + " Each entry is substantially larger than a TypeDefinitionRegistry, so this can be sized independently of"
+                                + " Schema Cache Size. The cache is a LRU. Set to 0 to disable the executable cache even if it is enabled"
+                                + " below.")
+        int executableSchemaCacheSize() default 32;
 
         @AttributeDefinition(
                 name = "Enable Executable Schema Cache",
@@ -226,16 +239,31 @@ public class DefaultQueryExecutor implements QueryExecutor {
         if (schemaCacheSize < 0) {
             schemaCacheSize = 0;
         }
+        int executableSchemaCacheSize = config.executableSchemaCacheSize();
+        if (executableSchemaCacheSize < 0) {
+            executableSchemaCacheSize = 0;
+        }
         maxQueryTokens = config.maxQueryTokens();
         maxWhitespaceTokens = config.maxWhitespaceTokens();
-        executableSchemaCacheEnabled = config.executableSchemaCacheEnabled() && schemaCacheSize > 0;
+        boolean wantExecutableCache = config.executableSchemaCacheEnabled();
+        if (wantExecutableCache && executableSchemaCacheSize == 0) {
+            LOGGER.info("Executable schema cache requested but executableSchemaCacheSize is 0; cache remains disabled");
+        }
 
-        // Insertion-order for maps accessed under the shared RW lock (get mutates access-order maps).
-        resourceToHashMap = new BoundedCache<>(schemaCacheSize, false);
-        hashToSchemaMap = new BoundedCache<>(schemaCacheSize, false);
-        // True LRU for the executable schema map (all access is under executableSchemaCacheLock).
-        hashToExecutableSchemaMap = new BoundedCache<>(schemaCacheSize, true);
-        executableSchemaInFlight.clear();
+        writeLock.lock();
+        try {
+            resourceToHashMap = new BoundedCache<>(schemaCacheSize, false);
+            hashToSchemaMap = new BoundedCache<>(schemaCacheSize, false);
+        } finally {
+            writeLock.unlock();
+        }
+
+        synchronized (executableSchemaCacheLock) {
+            executableSchemaCacheEnabled = wantExecutableCache && executableSchemaCacheSize > 0;
+            hashToExecutableSchemaMap = new BoundedCache<>(executableSchemaCacheSize, true);
+            executableSchemaInFlight.clear();
+            lastPurgedScalarGeneration = Long.MIN_VALUE;
+        }
         ExecutableNormalizedOperationFactory.Options.setDefaultOptions(
                 ExecutableNormalizedOperationFactory.Options.defaultOptions().maxFieldsCount(config.maxFieldCount()));
     }
@@ -529,6 +557,7 @@ public class DefaultQueryExecutor implements QueryExecutor {
 
         for (int attempt = 0; attempt < MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS; attempt++) {
             final long scalarGeneration = scalarsProvider.getScalarGeneration();
+            purgeStaleExecutableSchemas(scalarGeneration);
             BuiltExecutableSchema cached = getCachedExecutableSchema(schemaHash, scalarGeneration);
             if (cached != null) {
                 return cached.schema;
@@ -541,8 +570,35 @@ public class DefaultQueryExecutor implements QueryExecutor {
             // Result was stale relative to live converters — retry.
         }
 
-        throw new SlingGraphQLException("Executable schema build did not stabilize after "
-                + MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS + " attempts (scalar converters changing)");
+        LOGGER.warn(
+                "Executable schema build did not stabilize after {} attempts (scalar converters changing); serving an uncached schema",
+                MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS);
+        return buildSchema(typeRegistry).schema;
+    }
+
+    /**
+     * Drops executable-schema entries older than {@code liveGeneration} so unregistered
+     * {@code SlingScalarConverter} instances (and their bundle classloaders) are not retained
+     * until some other hash happens to be requested.
+     */
+    private void purgeStaleExecutableSchemas(long liveGeneration) {
+        if (lastPurgedScalarGeneration >= liveGeneration) {
+            return;
+        }
+        synchronized (executableSchemaCacheLock) {
+            if (lastPurgedScalarGeneration >= liveGeneration) {
+                return;
+            }
+            Iterator<Map.Entry<String, BuiltExecutableSchema>> it =
+                    hashToExecutableSchemaMap.entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<String, BuiltExecutableSchema> entry = it.next();
+                if (entry.getValue().scalarGeneration < liveGeneration) {
+                    it.remove();
+                }
+            }
+            lastPurgedScalarGeneration = liveGeneration;
+        }
     }
 
     /**

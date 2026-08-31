@@ -95,8 +95,13 @@ public class DefaultQueryExecutorCacheTest {
     }
 
     private void activate(int schemaCacheSize, boolean executableSchemaCacheEnabled) {
+        activate(schemaCacheSize, schemaCacheSize, executableSchemaCacheEnabled);
+    }
+
+    private void activate(int schemaCacheSize, int executableSchemaCacheSize, boolean executableSchemaCacheEnabled) {
         DefaultQueryExecutor.Config config = mock(DefaultQueryExecutor.Config.class);
         when(config.schemaCacheSize()).thenReturn(schemaCacheSize);
+        when(config.executableSchemaCacheSize()).thenReturn(executableSchemaCacheSize);
         when(config.executableSchemaCacheEnabled()).thenReturn(executableSchemaCacheEnabled);
         when(config.maxQueryTokens()).thenReturn(15000);
         when(config.maxWhitespaceTokens()).thenReturn(200000);
@@ -240,7 +245,7 @@ public class DefaultQueryExecutorCacheTest {
     }
 
     @Test
-    public void testExecutableSchemaCache_FailsWhenScalarGenerationNeverStabilizes() {
+    public void testExecutableSchemaCache_ServesUncachedSchemaWhenScalarGenerationNeverStabilizes() {
         activate(10, true);
         String sdl = "type Query { hello: String }";
         TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
@@ -251,12 +256,11 @@ public class DefaultQueryExecutorCacheTest {
         // Live generation always ahead of the snapshot used for wiring → never stable
         when(scalarsProvider.getScalarGeneration()).thenReturn(2L);
 
-        try {
-            executor.getExecutableSchema(hash, registry);
-            fail("Expected SlingGraphQLException when generation never stabilizes");
-        } catch (SlingGraphQLException e) {
-            assertTrue(e.getMessage().contains("did not stabilize"));
-        }
+        GraphQLSchema first = executor.getExecutableSchema(hash, registry);
+        GraphQLSchema second = executor.getExecutableSchema(hash, registry);
+        assertNotNull(first);
+        assertNotNull(second);
+        assertNotSame(first, second);
     }
 
     @Test
@@ -497,6 +501,73 @@ public class DefaultQueryExecutorCacheTest {
         inFlightMap().clear();
     }
 
+    @Test
+    public void testExecutableSchemaCache_EvictsLeastRecentlyUsed() throws Exception {
+        activate(10, 2, true);
+        TypeDefinitionRegistry registry1 =
+                executor.getTypeDefinitionRegistry("type Query { hello: String }", resource, new String[] {"test"});
+        TypeDefinitionRegistry registry2 =
+                executor.getTypeDefinitionRegistry("type Query { world: String }", resource, new String[] {"test"});
+        TypeDefinitionRegistry registry3 =
+                executor.getTypeDefinitionRegistry("type Query { third: String }", resource, new String[] {"test"});
+        String hash1 = SHA256Hasher.getHash("type Query { hello: String }");
+        String hash2 = SHA256Hasher.getHash("type Query { world: String }");
+        String hash3 = SHA256Hasher.getHash("type Query { third: String }");
+
+        GraphQLSchema first = executor.getExecutableSchema(hash1, registry1);
+        GraphQLSchema second = executor.getExecutableSchema(hash2, registry2);
+        assertSame(first, executor.getExecutableSchema(hash1, registry1));
+
+        GraphQLSchema third = executor.getExecutableSchema(hash3, registry3);
+        assertNotNull(third);
+        // Inspect without Map.get — that would count as an LRU access.
+        assertNotNull(cachedEntry(hash1));
+        assertNull(cachedEntry(hash2));
+        assertNotNull(cachedEntry(hash3));
+        assertSame(first, executor.getExecutableSchema(hash1, registry1));
+        GraphQLSchema secondAgain = executor.getExecutableSchema(hash2, registry2);
+        assertNotSame(second, secondAgain);
+    }
+
+    @Test
+    public void testExecutableSchemaCache_PurgesOtherHashesWhenScalarGenerationChanges() throws Exception {
+        activate(10, true);
+        TypeDefinitionRegistry registryA =
+                executor.getTypeDefinitionRegistry("type Query { hello: String }", resource, new String[] {"test"});
+        TypeDefinitionRegistry registryB =
+                executor.getTypeDefinitionRegistry("type Query { world: String }", resource, new String[] {"test"});
+        String hashA = SHA256Hasher.getHash("type Query { hello: String }");
+        String hashB = SHA256Hasher.getHash("type Query { world: String }");
+
+        assertNotNull(executor.getExecutableSchema(hashA, registryA));
+        assertNotNull(executor.getExecutableSchema(hashB, registryB));
+        assertNotNull(cachedEntry(hashA));
+        assertNotNull(cachedEntry(hashB));
+
+        when(scalarsProvider.getScalarGeneration()).thenReturn(1L);
+        when(scalarsProvider.getCustomScalars(any()))
+                .thenReturn(new SlingScalarsProvider.CustomScalars(1L, Collections.emptyList()));
+
+        GraphQLSchema rebuiltA = executor.getExecutableSchema(hashA, registryA);
+        assertNotNull(rebuiltA);
+        assertNull("Unrelated hash must be purged when scalar generation changes", cachedEntry(hashB));
+        assertNotNull(cachedEntry(hashA));
+        assertEquals(1L, cachedGeneration(hashA));
+    }
+
+    @Test
+    public void testExecutableSchemaCache_EnabledIndependentlyOfTypeRegistryCache() {
+        activate(0, 8, true);
+        String sdl = "type Query { hello: String }";
+        TypeDefinitionRegistry registry = executor.getTypeDefinitionRegistry(sdl, resource, new String[] {"test"});
+        String hash = SHA256Hasher.getHash(sdl);
+
+        GraphQLSchema first = executor.getExecutableSchema(hash, registry);
+        GraphQLSchema second = executor.getExecutableSchema(hash, registry);
+        assertNotNull(first);
+        assertSame(first, second);
+    }
+
     @SuppressWarnings("unchecked")
     private ConcurrentHashMap<String, CompletableFuture<?>> inFlightMap() throws Exception {
         Field field = DefaultQueryExecutor.class.getDeclaredField("executableSchemaInFlight");
@@ -505,14 +576,23 @@ public class DefaultQueryExecutorCacheTest {
     }
 
     private long cachedGeneration(String schemaHash) throws Exception {
-        Field field = DefaultQueryExecutor.class.getDeclaredField("hashToExecutableSchemaMap");
-        field.setAccessible(true);
-        @SuppressWarnings("unchecked")
-        Map<String, ?> map = (Map<String, ?>) field.get(executor);
-        Object entry = map.get(schemaHash);
+        Object entry = cachedEntry(schemaHash);
         assertNotNull(entry);
         Field genField = entry.getClass().getDeclaredField("scalarGeneration");
         genField.setAccessible(true);
         return genField.getLong(entry);
+    }
+
+    private Object cachedEntry(String schemaHash) throws Exception {
+        Field field = DefaultQueryExecutor.class.getDeclaredField("hashToExecutableSchemaMap");
+        field.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, ?> map = (Map<String, ?>) field.get(executor);
+        for (Map.Entry<String, ?> entry : map.entrySet()) {
+            if (schemaHash.equals(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        return null;
     }
 }
