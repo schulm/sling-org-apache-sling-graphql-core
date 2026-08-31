@@ -539,8 +539,9 @@ public class DefaultQueryExecutor implements QueryExecutor {
     }
 
     /**
-     * Cap retries when scalar converters keep changing mid-build so we never return a known-stale schema
-     * and never spin forever under continuous churn.
+     * Cap retries when scalar converters keep changing mid-build so we never spin forever under
+     * continuous churn. After this many attempts the caller is served one uncached
+     * {@link #buildSchema} result (the pre-cache behaviour) rather than failing the query.
      */
     private static final int MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS = 8;
 
@@ -548,7 +549,9 @@ public class DefaultQueryExecutor implements QueryExecutor {
      * Returns an executable schema for the given SDL hash. When the executable schema cache is enabled,
      * concurrent callers for the same schema hash <em>and</em> scalar generation share a single in-flight build.
      * If converters change during a build or while waiting, the call retries until the result matches the
-     * live generation or {@link #MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS} is exhausted.
+     * live generation or {@link #MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS} is exhausted. When the budget is
+     * exhausted, an uncached schema is built and returned so the request still completes; that schema
+     * is not published to the cache and may reflect a converter generation that has already moved on.
      */
     GraphQLSchema getExecutableSchema(@NotNull String schemaHash, @NotNull TypeDefinitionRegistry typeRegistry) {
         if (!executableSchemaCacheEnabled) {

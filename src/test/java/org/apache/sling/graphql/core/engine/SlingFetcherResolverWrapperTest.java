@@ -26,12 +26,10 @@ import graphql.TypeResolutionEnvironment;
 import graphql.language.Field;
 import graphql.schema.DataFetchingEnvironment;
 import graphql.schema.GraphQLObjectType;
-import graphql.schema.GraphQLSchema;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.graphql.api.SlingDataFetcher;
 import org.apache.sling.graphql.api.SlingGraphQLException;
 import org.apache.sling.graphql.api.SlingTypeResolver;
-import org.apache.sling.graphql.core.mocks.HumanDTO;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.Mock;
@@ -158,25 +156,6 @@ public class SlingFetcherResolverWrapperTest {
         SlingTypeResolverWrapper wrapper =
                 new SlingTypeResolverWrapper(typeResolverSelector, "test/resolver", "opts", "src");
         assertNull(wrapper.getType(env));
-    }
-
-    @Test
-    public void typeResolver_missingServiceFallsBackToClassSimpleName() {
-        TypeResolutionEnvironment env = mock(TypeResolutionEnvironment.class);
-        when(env.getGraphQLContext())
-                .thenReturn(
-                        GraphQLContext.newContext().of(Resource.class, resource).build());
-        when(typeResolverSelector.getSlingTypeResolver("test/resolver")).thenReturn(null);
-        HumanDTO human = new HumanDTO("1", "Luke", "Tatooine");
-        GraphQLSchema schema = mock(GraphQLSchema.class);
-        GraphQLObjectType objectType = mock(GraphQLObjectType.class);
-        when(env.getObject()).thenReturn(human);
-        when(env.getSchema()).thenReturn(schema);
-        when(schema.getObjectType("HumanDTO")).thenReturn(objectType);
-
-        SlingTypeResolverWrapper wrapper =
-                new SlingTypeResolverWrapper(typeResolverSelector, "test/resolver", "opts", "src");
-        assertSame(objectType, wrapper.getType(env));
     }
 
     @Test

@@ -20,7 +20,6 @@ package org.apache.sling.graphql.core.engine;
 
 import graphql.TypeResolutionEnvironment;
 import graphql.schema.GraphQLObjectType;
-import graphql.schema.GraphQLSchema;
 import graphql.schema.TypeResolver;
 import org.apache.sling.api.resource.Resource;
 import org.apache.sling.graphql.api.SlingGraphQLException;
@@ -53,25 +52,12 @@ class SlingTypeResolverWrapper implements TypeResolver {
         }
         final SlingTypeResolver<Object> resolver = selector.getSlingTypeResolver(name);
         if (resolver == null) {
-            return resolveByObjectClassName(environment);
+            return null;
         }
         Object r = resolver.getType(new TypeResolverEnvironmentWrapper(environment, currentResource, options, source));
         if (r instanceof GraphQLObjectType) {
             return (GraphQLObjectType) r;
         }
         return null;
-    }
-
-    /**
-     * graphql-java's default when no {@link TypeResolver} is wired: map the runtime class
-     * simple name to a schema object type.
-     */
-    private static GraphQLObjectType resolveByObjectClassName(TypeResolutionEnvironment environment) {
-        Object value = environment.getObject();
-        GraphQLSchema schema = environment.getSchema();
-        if (value == null || schema == null) {
-            return null;
-        }
-        return schema.getObjectType(value.getClass().getSimpleName());
     }
 }
