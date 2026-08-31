@@ -167,10 +167,10 @@ public class DefaultQueryExecutor implements QueryExecutor {
         @AttributeDefinition(
                 name = "Enable Executable Schema Cache",
                 description =
-                        "When enabled, caches the executable GraphQLSchema (makeExecutableSchema result) keyed by SDL hash,"
+                        "Enabled by default. Caches the executable GraphQLSchema (makeExecutableSchema result) keyed by SDL hash,"
                                 + " with per-key single-flight so concurrent requests for the same schema share one build."
-                                + " Disable to restore the previous behaviour of rebuilding the executable schema on every request.")
-        boolean executableSchemaCacheEnabled() default false;
+                                + " Set to false to rebuild the executable schema on every request.")
+        boolean executableSchemaCacheEnabled() default true;
 
         @AttributeDefinition(
                 name = "Max Query Tokens",
@@ -498,7 +498,7 @@ public class DefaultQueryExecutor implements QueryExecutor {
         2. a mapping between the hash and the TypeDefinitionRegistry
 
         The request Resource is no longer baked into RuntimeWiring; it is supplied via GraphQLContext per execution.
-        An optional third cache (hash → GraphQLSchema) is controlled by executableSchemaCacheEnabled.
+        A third cache (hash → GraphQLSchema) is controlled by executableSchemaCacheEnabled (on by default).
          */
         String resourceToHashMapKey = getCacheKey(currentResource, selectors);
         String oldHash = resourceToHashMap.get(resourceToHashMapKey);
@@ -546,7 +546,8 @@ public class DefaultQueryExecutor implements QueryExecutor {
     private static final int MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS = 8;
 
     /**
-     * Returns an executable schema for the given SDL hash. When the executable schema cache is enabled,
+     * Returns an executable schema for the given SDL hash. The executable schema cache is on by default.
+     * When it is enabled,
      * concurrent callers for the same schema hash <em>and</em> scalar generation share a single in-flight build.
      * If converters change during a build or while waiting, the call retries until the result matches the
      * live generation or {@link #MAX_EXECUTABLE_SCHEMA_BUILD_ATTEMPTS} is exhausted. When the budget is

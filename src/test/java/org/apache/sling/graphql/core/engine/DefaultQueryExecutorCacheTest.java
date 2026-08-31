@@ -110,6 +110,14 @@ public class DefaultQueryExecutorCacheTest {
     }
 
     @Test
+    public void testExecutableSchemaCache_AnnotationDefaultIsEnabled() throws Exception {
+        Object defaultValue = DefaultQueryExecutor.Config.class
+                .getMethod("executableSchemaCacheEnabled")
+                .getDefaultValue();
+        assertEquals(Boolean.TRUE, defaultValue);
+    }
+
+    @Test
     public void testGetTypeDefinitionRegistry_ValidSDL() {
         String validSDL = "type Query { hello: String }";
         String[] selectors = {"test"};
